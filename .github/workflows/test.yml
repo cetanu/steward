@@ -19,12 +19,12 @@ jobs:
     - name: Compile Protobufs
       run: |
         poetry run python scripts/download_protos.py
+        tar cvf - proto | gzip > proto.tar.gz
     - name: Archive production artifacts
       uses: actions/upload-artifact@v3
       with:
         name: protcol_buffers
-        path: |
-          proto
+        path: proto.tar.gz
 
   check:
     name: Check
@@ -38,6 +38,9 @@ jobs:
         uses: actions/download-artifact@v3
         with:
           name: protcol_buffers
+
+      - name: Untar protobufs
+        run: tar xvf proto.tar.gz
 
       - name: Install stable toolchain
         uses: actions-rs/toolchain@v1
@@ -64,6 +67,9 @@ jobs:
         with:
           name: protcol_buffers
 
+      - name: Untar protobufs
+        run: tar xvf proto.tar.gz
+
       - name: Install stable toolchain
         uses: actions-rs/toolchain@v1
         with:
@@ -88,6 +94,9 @@ jobs:
         uses: actions/download-artifact@v3
         with:
           name: protcol_buffers
+
+      - name: Untar protobufs
+        run: tar xvf proto.tar.gz
 
       - name: Install stable toolchain
         uses: actions-rs/toolchain@v1
