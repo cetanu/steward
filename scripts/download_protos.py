@@ -70,7 +70,8 @@ for package in packages:
     name = Path(package.name)
     namespace = Path(package.namespace)
     proto_root = Path(package.directory)
-    archive = Path(f"{package.name}.zip")
+    zipname = f"{package.name}.zip"
+    archive = Path(zipname)
 
     if not archive.exists():
         logger.msg(f"Downloading {package.name} protocol buffers from Github")
@@ -89,4 +90,8 @@ for package in packages:
                 logger.msg(f"Extracting {file}")
                 zipref.extract(member=file, path=".")
         shutil.copytree(proto_root / namespace, name)
+
+        logger.msg("Cleaning up old directory and zipfile")
+        shutil.rmtree(proto_root.parts[0])
+        os.remove(zipname)
 

@@ -5,9 +5,6 @@ on: [push, pull_request]
 jobs:
   compile_protos:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python-version: [3.8]
     steps:
     - uses: actions/checkout@v2
     - name: Set up Python ${{ matrix.python-version }}
@@ -22,7 +19,6 @@ jobs:
     - name: Compile Protobufs
       run: |
         poetry run python scripts/download_protos.py
-        poetry install
     - name: Archive production artifacts
       uses: actions/upload-artifact@v3
       with:

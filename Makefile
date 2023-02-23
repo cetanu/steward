@@ -3,7 +3,7 @@ clean:
 	docker-compose down --remove-orphans
 
 daemonize:
-	docker-compose up --detach --build server envoy
+	docker-compose up --detach --force-recreate --build server envoy
 
 tavern:
 	docker-compose build tavern
