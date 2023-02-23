@@ -38,3 +38,13 @@ services:
       - 6379:6379
     expose:
       - 6379
+
+  tavern:
+    build:
+      context: containers
+      dockerfile: tavern.Dockerfile
+    volumes:
+      - ./test-reports:/proj/test-reports:delegated
+    links:
+      - envoy
+

@@ -16,4 +16,4 @@ COPY proto proto
 COPY src src
 RUN cargo build
 
-CMD [ "/project/target/debug/limiter" ]
+CMD [ "/project/target/debug/steward" ]

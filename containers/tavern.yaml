@@ -1,0 +1,21 @@
+---
+test_name: Test getting rate limited
+
+stages:
+  - name: Make a single request, which should be allowed
+    request:
+      url: http://envoy:8080/headers
+      method: GET
+    response:
+      status_code: 200
+  - name: Spamming the endpoint results in a rate limit response
+    max_retries: 30
+    request:
+      url: http://envoy:8080/headers
+      method: GET
+    response:
+      status_code: 429
+      json:
+        grpc_status: Unavailable
+        message: ""
+
