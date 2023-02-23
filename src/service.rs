@@ -21,6 +21,12 @@ impl Steward {
     }
 }
 
+impl Default for Steward {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[tonic::async_trait]
 impl RateLimitService for Steward {
     async fn should_rate_limit(
