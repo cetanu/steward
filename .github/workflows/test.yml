@@ -26,61 +26,34 @@ jobs:
         name: protcol_buffers
         path: proto.tar.gz
 
-  check:
-    name: Check
-    needs: compile_protos
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout sources
-        uses: actions/checkout@v2
-
-      - name: Download a single artifact
-        uses: actions/download-artifact@v3
-        with:
-          name: protcol_buffers
-
-      - name: Untar protobufs
-        run: tar xvf proto.tar.gz
-
-      - name: Install stable toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
-
-      - name: Run cargo check
-        uses: actions-rs/cargo@v1
-        with:
-          command: check
-
-  test:
-    name: Test Suite
-    needs: compile_protos
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout sources
-        uses: actions/checkout@v2
-
-      - name: Download a single artifact
-        uses: actions/download-artifact@v3
-        with:
-          name: protcol_buffers
-
-      - name: Untar protobufs
-        run: tar xvf proto.tar.gz
-
-      - name: Install stable toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
-
-      - name: Run cargo test
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
+  # No unit tests currently
+  # test:
+  #   name: Test Suite
+  #   needs: compile_protos
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - name: Checkout sources
+  #       uses: actions/checkout@v2
+  #
+  #     - name: Download a single artifact
+  #       uses: actions/download-artifact@v3
+  #       with:
+  #         name: protcol_buffers
+  #
+  #     - name: Untar protobufs
+  #       run: tar xvf proto.tar.gz
+  #
+  #     - name: Install stable toolchain
+  #       uses: actions-rs/toolchain@v1
+  #       with:
+  #         profile: minimal
+  #         toolchain: stable
+  #         override: true
+  #
+  #     - name: Run cargo test
+  #       uses: actions-rs/cargo@v1
+  #       with:
+  #         command: test
 
   lints:
     name: Lints
@@ -117,3 +90,22 @@ jobs:
         with:
           command: clippy
           args: -- -D warnings
+
+  integration:
+    name: Integration test
+    needs: compile_protos
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v2
+
+      - name: Download a single artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: protcol_buffers
+
+      - name: Untar protobufs
+        run: tar xvf proto.tar.gz
+
+      - name: Run docker integration tests
+        run: make test
