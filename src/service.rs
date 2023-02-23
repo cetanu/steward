@@ -32,9 +32,8 @@ impl RateLimitService for Steward {
         let mut values = vec![];
         for descriptor in request.descriptors.iter() {
             for entry in descriptor.entries.iter() {
-                let key = format!("{}_{}", entry.key, entry.value);
-                let value =
-                    increment_entry(&mut con, &request.domain, &key, &request.hits_addend.max(1));
+                let key = format!("{}_{}_{}", &request.domain, entry.key, entry.value);
+                let value = increment_entry(&mut con, &key, &request.hits_addend.max(1));
                 values.push(value);
             }
         }

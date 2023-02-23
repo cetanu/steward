@@ -7,9 +7,9 @@ pub fn connect(addr: &str) -> RedisResult<Connection> {
     client.get_connection()
 }
 
-pub fn increment_entry(con: &mut Connection, domain: &str, key: &str, hits: &u32) -> i64 {
+pub fn increment_entry(con: &mut Connection, key: &str, hits: &u32) -> i64 {
     let existed = con.exists(key);
-    let incremented_value = con.hincr(domain, key, hits);
+    let incremented_value = con.incr(key, hits);
 
     let value = match incremented_value {
         Ok(Value::Int(n)) => n,
