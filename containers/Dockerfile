@@ -15,5 +15,6 @@ COPY build.rs build.rs
 COPY proto proto
 COPY src src
 RUN cargo build
+COPY containers/steward.yaml steward.yaml
 
 CMD [ "/project/target/debug/steward" ]

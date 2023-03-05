@@ -9,8 +9,9 @@ services:
       - 5001:5001
     links:
       - redis
+      - mock_config
     environment:
-      RUST_LOG: DEBUG
+      RUST_LOG: steward=DEBUG
 
   envoy:
     build:
@@ -48,3 +49,11 @@ services:
     links:
       - envoy
 
+  mock_config:
+    build:
+      context: containers
+      dockerfile: mock_config.Dockerfile
+    ports:
+      - 8000:8000
+    expose:
+      - 8000
