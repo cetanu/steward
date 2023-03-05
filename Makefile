@@ -22,4 +22,8 @@ watch-envoy:
 		| jq --sort-keys -R 'fromjson?'
 
 
+pcap-redis:
+	docker run -v `pwd`:/tmp/pcap -it --rm --net container:limiter_server_1 nicolaka/netshoot tcpdump -n -w /tmp/pcap/capture.pcap port 6379
+
+
 test: daemonize tavern
