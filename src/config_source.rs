@@ -6,6 +6,7 @@ use std::{env, net::Ipv4Addr};
 use crate::service::RateLimitConfigs;
 
 pub async fn get_config() -> Result<RateLimitConfigs, String> {
+    // TODO: no hardcode
     get_http_config(
         "http://mock_config:8000/api/rate_limits"
             .try_into()
@@ -17,7 +18,7 @@ pub async fn get_config() -> Result<RateLimitConfigs, String> {
 pub async fn get_http_config(url: Url) -> Result<RateLimitConfigs, String> {
     match reqwest::get(url).await {
         Ok(response) => Ok(response.json().await.unwrap()),
-        Err(e) => Err(format!("{:?}", e)),
+        Err(e) => Err(format!("{e:?}")),
     }
 }
 
@@ -46,7 +47,7 @@ impl Settings {
         let config_path = env::var("STEWARD_CONFIG_PATH").unwrap_or_else(|_| "steward.yaml".into());
 
         let mut s = Config::builder();
-        for path in config_path.split(",") {
+        for path in config_path.split(',') {
             s = s.add_source(File::with_name(path));
         }
         s = s.add_source(Environment::with_prefix("STEWARD"));

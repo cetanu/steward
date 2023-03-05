@@ -119,7 +119,7 @@ impl RateLimitService for Steward {
                     // for ttl in TTLS {
                     //     db.increment(key, req, ttl)
                     // }
-                    database.increment_entry(&key, &request.hits_addend.max(1), None)
+                    database.increment_entry(key, &request.hits_addend.max(1), None)
                 }
                 Err(e) => {
                     error!("Failed to acquire lock for database: {e}");
@@ -133,10 +133,10 @@ impl RateLimitService for Steward {
                 let key = format!("{}_{}_{}", &request.domain, limit.key, limit.value);
                 if entries.contains(&key) {
                     let rate_limit = limit.rate_limit.requests_per_unit;
-                    match limit.rate_limit.unit {
-                        Unit::Seconds => (),
-                        _ => (),
-                    }
+                    // match limit.rate_limit.unit {
+                    //     Unit::Seconds => (),
+                    //     _ => (),
+                    // }
                     debug!("Checking if rate ({rate}) is over limit ({rate_limit}) for {key}");
 
                     // TODO: we need to scale RPS by the unit
