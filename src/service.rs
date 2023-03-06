@@ -1,72 +1,22 @@
-use crate::db;
-use crate::proto::envoy::extensions::common::ratelimit::v3::rate_limit_descriptor::RateLimitOverride;
-use crate::proto::envoy::service::ratelimit::v3::rate_limit_service_server::RateLimitService;
-use crate::proto::envoy::service::ratelimit::v3::{RateLimitRequest, RateLimitResponse};
-use crate::response::limit_response;
-
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use rayon::prelude::*;
-use serde::{Deserialize, Serialize};
 use tokio::sync::watch::Receiver;
 use tonic::Response;
-
 use tracing::{debug, error, warn};
+
+use crate::db;
+use crate::proto::envoy::service::ratelimit::v3::rate_limit_service_server::RateLimitService;
+use crate::proto::envoy::service::ratelimit::v3::{RateLimitRequest, RateLimitResponse};
+use crate::rate_limits::{Descriptor, RateLimit};
+use crate::response::limit_response;
 
 pub type RateLimitConfigs = HashMap<String, Vec<Descriptor>>;
 
 pub struct Steward {
     db: Arc<Mutex<db::RedisClient>>,
     rx: Receiver<RateLimitConfigs>,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum Unit {
-    Unknown,
-    Seconds,
-    Minutes,
-    Hours,
-    Days,
-    Months,
-    Years,
-}
-
-impl From<i32> for Unit {
-    fn from(value: i32) -> Self {
-        match value {
-            1 => Unit::Seconds,
-            2 => Unit::Minutes,
-            3 => Unit::Hours,
-            4 => Unit::Days,
-            5 => Unit::Months,
-            6 => Unit::Years,
-            _ => Unit::Unknown,
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct Descriptor {
-    key: String,
-    value: String,
-    rate_limit: RateLimit,
-}
-
-#[derive(Serialize, Deserialize)]
-struct RateLimit {
-    unit: Unit,
-    requests_per_unit: i64,
-}
-
-impl From<&RateLimitOverride> for RateLimit {
-    fn from(value: &RateLimitOverride) -> Self {
-        Self {
-            requests_per_unit: value.requests_per_unit as i64,
-            unit: Unit::from(value.unit),
-        }
-    }
 }
 
 impl Steward {
@@ -122,13 +72,13 @@ impl RateLimitService for Steward {
                     database.increment_entry(key, &request.hits_addend.max(1), None)
                 }
                 Err(e) => {
-                    error!("Failed to acquire lock for database: {e}");
-                    panic!()
+                    error!("Failed to acquire lock for database: {e}. Setting rate to zero.");
+                    0
                 }
             });
             let rate = results.max().unwrap_or(0);
 
-            debug!("Reading descriptor entries from request");
+            debug!("Reading rate limit configs from config source");
             for limit in rate_limits.iter() {
                 let key = format!("{}_{}_{}", &request.domain, limit.key, limit.value);
                 if entries.contains(&key) {
@@ -142,13 +92,13 @@ impl RateLimitService for Steward {
                     // TODO: we need to scale RPS by the unit
 
                     if rate >= rate_limit {
-                        warn!("Request is over the limit");
+                        warn!(rate_limit_key=%key, limit=%rate_limit, client_rate=%rate, "Request is over the limit");
                         return Ok(Response::new(limit_response(true)));
                     }
                 }
             }
         } else {
-            error!("Could not obtain config from channel");
+            error!("Could not obtain rate limit config from channel");
         }
         Ok(Response::new(limit_response(false)))
     }

@@ -3,7 +3,7 @@ use redis::{Client, Commands, Connection, RedisResult, Value};
 impl RedisClient {
     pub fn new(addr: &str, interval: usize) -> Self {
         Self {
-            con: Self::connect(addr).unwrap(),
+            db: Self::connect(addr).unwrap(),
             interval,
         }
     }
@@ -14,23 +14,22 @@ impl RedisClient {
     }
 
     pub fn increment_entry(&mut self, key: &str, hits: &u32, interval: Option<usize>) -> i64 {
-        let existed = self.con.exists(key);
-        let incremented_value = self.con.incr(key, hits);
-
-        let value = match incremented_value {
-            Ok(Value::Int(n)) => n,
-            _ => panic!(),
-        };
+        let mut current_rate = 0;
+        let existed = self.db.exists(key);
+        let incremented_value = self.db.incr(key, hits);
+        if let Ok(Value::Int(n)) = incremented_value {
+            current_rate = n;
+        }
         if let Ok(false) = existed {
-            self.con
+            self.db
                 .expire::<&str, u64>(key, interval.unwrap_or(self.interval))
                 .unwrap();
         }
-        value
+        current_rate
     }
 }
 
 pub struct RedisClient {
-    con: Connection,
+    db: Connection,
     interval: usize,
 }
