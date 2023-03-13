@@ -13,6 +13,14 @@ async def get_configs():
                     "unit": "seconds",
                     "requests_per_unit": 5
                 }
-            }
+            },
+            {
+                "key": "protect_the_headers_api",
+                "value": "1",
+                "rate_limit": {
+                    "unit": "minutes",
+                    "requests_per_unit": 100
+                }
+            },
         ]
     }

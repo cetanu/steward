@@ -11,7 +11,7 @@ services:
       - redis
       - mock_config
     environment:
-      RUST_LOG: steward=DEBUG
+      RUST_LOG: steward=INFO
 
   envoy:
     build:

@@ -39,6 +39,7 @@ pub struct Settings {
     pub listen: ListenConfig,
     pub rate_limit_configs: ConfigSource,
     pub redis_host: String,
+    pub redis_connections: Option<usize>,
     pub rate_ttl: usize,
 }
 

@@ -59,7 +59,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let steward = Steward::new(settings.redis_host.as_str(), settings.rate_ttl, rx);
+    let steward = Steward::new(
+        settings.redis_host.as_str(),
+        settings.rate_ttl,
+        rx,
+        settings.redis_connections.unwrap_or(1),
+    );
 
     // gRPC server setup
     let addr = SocketAddr::new(

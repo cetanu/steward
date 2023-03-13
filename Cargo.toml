@@ -28,6 +28,7 @@ prost-types = "0.9"
 
 # Parallelism
 rayon = "1"
+crossbeam = "0.8"
 
 # Reading config from disk
 config = "0.13"

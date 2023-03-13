@@ -1,10 +1,11 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
+use crossbeam::deque::{Injector, Steal};
 use rayon::prelude::*;
 use tokio::sync::watch::Receiver;
 use tonic::Response;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::db;
 use crate::proto::envoy::service::ratelimit::v3::rate_limit_service_server::RateLimitService;
@@ -15,16 +16,48 @@ use crate::response::limit_response;
 pub type RateLimitConfigs = HashMap<String, Vec<Descriptor>>;
 
 pub struct Steward {
-    db: Arc<Mutex<db::RedisClient>>,
     rx: Receiver<RateLimitConfigs>,
+    db: Arc<Mutex<db::RedisClient>>,
+    db_pool: Vec<Arc<Mutex<db::RedisClient>>>,
 }
 
 impl Steward {
-    pub fn new(redis_host: &str, rate_ttl: usize, rx: Receiver<RateLimitConfigs>) -> Self {
-        Self {
-            db: Arc::new(Mutex::new(db::RedisClient::new(redis_host, rate_ttl))),
-            rx,
+    pub fn new(
+        redis_host: &str,
+        default_rate_ttl: usize,
+        rx: Receiver<RateLimitConfigs>,
+        pool_size: usize,
+    ) -> Self {
+        let mut db_pool = vec![];
+        for _ in 0..pool_size {
+            db_pool.push(Self::new_db_connection(redis_host, default_rate_ttl));
         }
+
+        Self {
+            db: Self::new_db_connection(redis_host, default_rate_ttl),
+            rx,
+            db_pool,
+        }
+    }
+
+    fn acquire_db_connection(&self) -> Result<MutexGuard<db::RedisClient>, String> {
+        for con in self.db_pool.iter() {
+            match con.try_lock() {
+                Ok(lock) => return Ok(lock),
+                Err(_) => continue,
+            };
+        }
+        match self.db.lock() {
+            Ok(l) => Ok(l),
+            Err(e) => Err(format!("{e}")),
+        }
+    }
+
+    fn new_db_connection(redis_host: &str, default_rate_ttl: usize) -> Arc<Mutex<db::RedisClient>> {
+        Arc::new(Mutex::new(db::RedisClient::new(
+            redis_host,
+            default_rate_ttl,
+        )))
     }
 }
 
@@ -35,66 +68,83 @@ impl RateLimitService for Steward {
         request: tonic::Request<RateLimitRequest>,
     ) -> Result<Response<RateLimitResponse>, tonic::Status> {
         let request = request.into_inner();
-        // debug!(request = ?request, "Received request");
+        debug!("Received request");
         if let Some(rate_limits) = self.rx.borrow().get(&request.domain) {
             debug!("Loaded rate limits from config source");
-            let mut entries = vec![];
+            let mut entries = HashMap::with_capacity(request.descriptors.len());
 
             debug!("Reading descriptor entries from request");
             for descriptor in request.descriptors.iter() {
                 debug!("Descriptor: {descriptor:?}");
 
-                // TODO: somehow pass the group of entries, along with their overridden limit
-                match &descriptor.limit {
-                    Some(limit) => debug!(
-                        "{:?}",
-                        serde_json::to_string(&RateLimit::from(limit)).unwrap()
-                    ),
-                    None => (),
-                }
+                let limit_override = descriptor.limit.as_ref().map(RateLimit::from);
 
                 for entry in descriptor.entries.iter() {
-                    debug!("Entry: {entry:?}");
                     let key = format!("{}_{}_{}", &request.domain, entry.key, entry.value);
-                    entries.push(key);
+                    for limit in rate_limits.iter() {
+                        let requests_per_unit = limit.rate_limit.requests_per_unit;
+                        let config_key = format!(
+                            "{}_{}_{}_{}_{}",
+                            &request.domain,
+                            limit.key,
+                            limit.value,
+                            requests_per_unit,
+                            limit.rate_limit.unit.clone() as i32
+                        );
+                        if config_key.starts_with(&key) {
+                            debug!("Rate limit config matches descriptor entry: {config_key}");
+                            if let Some(override_) = limit_override.clone() {
+                                entries.insert(config_key, override_);
+                            } else {
+                                entries.insert(config_key, limit.rate_limit.to_owned());
+                            }
+                        } else {
+                            debug!("{key} did not match {config_key}");
+                        }
+                    }
                 }
             }
 
-            let results = entries.par_iter().map(|key| match self.db.lock() {
-                Ok(mut database) => {
-                    debug!("Incrementing entry '{key}' in db");
-                    // TODO: support rate limit override
+            let mut results = HashMap::with_capacity(entries.len());
+            let injector = Injector::new();
 
-                    // in theory, we have TTLs for seconds, minutes, days
-                    // for ttl in TTLS {
-                    //     db.increment(key, req, ttl)
-                    // }
-                    database.increment_entry(key, &request.hits_addend.max(1), None)
-                }
-                Err(e) => {
-                    error!("Failed to acquire lock for database: {e}. Setting rate to zero.");
-                    0
-                }
-            });
-            let rate = results.max().unwrap_or(0);
-
-            debug!("Reading rate limit configs from config source");
-            for limit in rate_limits.iter() {
-                let key = format!("{}_{}_{}", &request.domain, limit.key, limit.value);
-                if entries.contains(&key) {
-                    let rate_limit = limit.rate_limit.requests_per_unit;
-                    // match limit.rate_limit.unit {
-                    //     Unit::Seconds => (),
-                    //     _ => (),
-                    // }
-                    debug!("Checking if rate ({rate}) is over limit ({rate_limit}) for {key}");
-
-                    // TODO: we need to scale RPS by the unit
-
-                    if rate >= rate_limit {
-                        warn!(rate_limit_key=%key, limit=%rate_limit, client_rate=%rate, "Request is over the limit");
-                        return Ok(Response::new(limit_response(true)));
+            entries
+                .par_iter()
+                .for_each(|(key, limit)| match self.acquire_db_connection() {
+                    Ok(mut client) => {
+                        let injector = &injector;
+                        let interval = limit.unit.clone().into();
+                        info!("Incrementing entry '{key}' in db");
+                        let val = client.increment_entry(
+                            key,
+                            &request.hits_addend.max(1),
+                            Some(interval),
+                        );
+                        injector.push((key, val));
                     }
+                    Err(e) => {
+                        error!("Failed to acquire DB connection: {e}");
+                        injector.push((key, 0));
+                    }
+                });
+
+            while let Steal::Success((key, value)) = injector.steal() {
+                debug!("Entry {key} has rate of {value}");
+                results.insert(key, value);
+            }
+            debug!("Results: {:?}", results);
+
+            debug!("Checking if any rate limit has been hit");
+            for (entry_key, limit) in entries.iter() {
+                debug!("Checking if {entry_key} should rate limit");
+                let requests_per_unit = limit.requests_per_unit;
+                let rate = results.get(entry_key).unwrap();
+                info!(
+                    "Checking if rate ({rate}) is over limit ({requests_per_unit}) for {entry_key}"
+                );
+                if rate >= &requests_per_unit {
+                    warn!(rate_limit_key=%entry_key, limit=%requests_per_unit, client_rate=%rate, "Request is over the limit");
+                    return Ok(Response::new(limit_response(true)));
                 }
             }
         } else {

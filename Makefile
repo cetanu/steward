@@ -1,6 +1,5 @@
 clean:
-	docker-compose kill
-	docker-compose down --remove-orphans
+	docker-compose down --rmi local -v --remove-orphans -t 1
 
 daemonize:
 	docker-compose up --detach --force-recreate --build server envoy
@@ -12,9 +11,9 @@ tavern:
 logs:
 	docker-compose logs server
 
-run:
+run: clean
 	docker-compose up --detach --build envoy
-	docker-compose up --build server
+	docker-compose up --build --force-recreate server
 
 watch-envoy:
 	docker-compose up --build envoy \
