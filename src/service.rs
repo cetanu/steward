@@ -29,8 +29,10 @@ impl Steward {
         pool_size: usize,
     ) -> Self {
         let mut db_pool = vec![];
-        for _ in 0..pool_size {
-            db_pool.push(Self::new_db_connection(redis_host, default_rate_ttl));
+        if pool_size > 1 {
+            for _ in 1..pool_size {
+                db_pool.push(Self::new_db_connection(redis_host, default_rate_ttl));
+            }
         }
 
         Self {
@@ -41,6 +43,7 @@ impl Steward {
     }
 
     fn acquire_db_connection(&self) -> Result<MutexGuard<db::RedisClient>, String> {
+        // TODO: avoid having to iterate all N locks????
         for con in self.db_pool.iter() {
             match con.try_lock() {
                 Ok(lock) => return Ok(lock),

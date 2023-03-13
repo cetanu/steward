@@ -61,7 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let steward = Steward::new(
         settings.redis_host.as_str(),
-        settings.rate_ttl,
+        settings.default_ttl,
         rx,
         settings.redis_connections.unwrap_or(1),
     );

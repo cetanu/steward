@@ -62,7 +62,8 @@ listen:
 rate_limit_configs:
   Http: http://mock_config:8000/api/rate_limits
 redis_host: redis
-rate_ttl: 10
+redis_connections: 8
+default_ttl: 10
 ```
 
 ### `rate_limit_configs`

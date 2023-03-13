@@ -40,7 +40,7 @@ pub struct Settings {
     pub rate_limit_configs: ConfigSource,
     pub redis_host: String,
     pub redis_connections: Option<usize>,
-    pub rate_ttl: usize,
+    pub default_ttl: usize,
 }
 
 impl Settings {
