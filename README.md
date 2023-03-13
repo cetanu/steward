@@ -76,16 +76,18 @@ Either a `Http` or `File` location can be specified.
 Example of what the service expects the location to contain:
 
 ```json
-        "domain": [
-            {
-                "key": "descriptor_key",
-                "value": "descriptor_value",
-                "rate_limit": {
-                    "unit": "<seconds|minutes|hours|days|months|years>",
-                    "requests_per_unit": 12345
-                }
+{
+    "domain": [
+        {
+            "key": "descriptor_key",
+            "value": "descriptor_value",
+            "rate_limit": {
+                "unit": "<seconds|minutes|hours|days|months|years>",
+                "requests_per_unit": 12345
             }
-        ]
+        }
+    ]
+}
 ```
 
 There can be any number of domains and descriptors.
