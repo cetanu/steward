@@ -1,13 +1,13 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard};
 
 use crossbeam::deque::{Injector, Steal};
+use r2d2_redis::r2d2::Pool;
+use r2d2_redis::{r2d2, redis::Commands, redis::Value, RedisConnectionManager};
 use rayon::prelude::*;
 use tokio::sync::watch::Receiver;
 use tonic::Response;
 use tracing::{debug, error, info, warn};
 
-use crate::db;
 use crate::proto::envoy::service::ratelimit::v3::rate_limit_service_server::RateLimitService;
 use crate::proto::envoy::service::ratelimit::v3::{RateLimitRequest, RateLimitResponse};
 use crate::rate_limits::{Descriptor, RateLimit};
@@ -17,8 +17,8 @@ pub type RateLimitConfigs = HashMap<String, Vec<Descriptor>>;
 
 pub struct Steward {
     rx: Receiver<RateLimitConfigs>,
-    db: Arc<Mutex<db::RedisClient>>,
-    db_pool: Vec<Arc<Mutex<db::RedisClient>>>,
+    pool: Pool<RedisConnectionManager>,
+    ttl: usize,
 }
 
 impl Steward {
@@ -28,39 +28,36 @@ impl Steward {
         rx: Receiver<RateLimitConfigs>,
         pool_size: usize,
     ) -> Self {
-        let mut db_pool = vec![];
-        if pool_size > 1 {
-            for _ in 1..pool_size {
-                db_pool.push(Self::new_db_connection(redis_host, default_rate_ttl));
-            }
-        }
+        let manager = RedisConnectionManager::new(format!("redis://{redis_host}")).unwrap();
+        let pool = r2d2::Pool::builder()
+            .max_size(pool_size as u32)
+            .build(manager)
+            .unwrap();
 
         Self {
-            db: Self::new_db_connection(redis_host, default_rate_ttl),
             rx,
-            db_pool,
+            pool,
+            ttl: default_rate_ttl,
         }
     }
 
-    fn acquire_db_connection(&self) -> Result<MutexGuard<db::RedisClient>, String> {
-        // TODO: avoid having to iterate all N locks????
-        for con in self.db_pool.iter() {
-            match con.try_lock() {
-                Ok(lock) => return Ok(lock),
-                Err(_) => continue,
-            };
+    fn increment_entry(&self, key: &str, hits: &u32, interval: Option<usize>) -> i64 {
+        let mut conn = self.pool.get().unwrap();
+        let mut current_rate = 0;
+        let interval = interval.unwrap_or(self.ttl);
+        let incremented_value = conn.incr(key, hits.to_owned());
+        if let Ok(Value::Int(n)) = incremented_value {
+            current_rate = n;
         }
-        match self.db.lock() {
-            Ok(l) => Ok(l),
-            Err(e) => Err(format!("{e}")),
+        // Key was created, because 1 means that INCR was performed on either 0 or null key
+        // Therefore, we should set it to expire
+        if current_rate == 1 {
+            match conn.expire::<&str, u64>(key, interval) {
+                Err(e) => error!("Failed to set expiry for key: {e}"),
+                Ok(_) => debug!("Set expiry for key to {interval}"),
+            }
         }
-    }
-
-    fn new_db_connection(redis_host: &str, default_rate_ttl: usize) -> Arc<Mutex<db::RedisClient>> {
-        Arc::new(Mutex::new(db::RedisClient::new(
-            redis_host,
-            default_rate_ttl,
-        )))
+        current_rate
     }
 }
 
@@ -111,25 +108,13 @@ impl RateLimitService for Steward {
             let mut results = HashMap::with_capacity(entries.len());
             let injector = Injector::new();
 
-            entries
-                .par_iter()
-                .for_each(|(key, limit)| match self.acquire_db_connection() {
-                    Ok(mut client) => {
-                        let injector = &injector;
-                        let interval = limit.unit.clone().into();
-                        info!("Incrementing entry '{key}' in db");
-                        let val = client.increment_entry(
-                            key,
-                            &request.hits_addend.max(1),
-                            Some(interval),
-                        );
-                        injector.push((key, val));
-                    }
-                    Err(e) => {
-                        error!("Failed to acquire DB connection: {e}");
-                        injector.push((key, 0));
-                    }
-                });
+            entries.par_iter().for_each(|(key, limit)| {
+                let injector = &injector;
+                let interval = limit.unit.clone().into();
+                info!("Incrementing entry '{key}' in db");
+                let val = self.increment_entry(key, &request.hits_addend.max(1), Some(interval));
+                injector.push((key, val));
+            });
 
             while let Steal::Success((key, value)) = injector.steal() {
                 debug!("Entry {key} has rate of {value}");
