@@ -2,7 +2,7 @@ listen:
   addr: 0.0.0.0
   port: 5001
 rate_limit_configs:
-  Http: http://mock_config:8000/api/rate_limits
+  http: http://mock_config:8000/api/rate_limits
 redis_host: redis
 redis_connections: 8
 default_ttl: 10

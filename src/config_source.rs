@@ -23,6 +23,7 @@ pub async fn get_http_config(url: Url) -> Result<RateLimitConfigs, String> {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all="lowercase")]
 pub enum ConfigSource {
     File(String),
     Http(String),

@@ -1,9 +1,8 @@
 use std::collections::HashMap;
 
 use crossbeam::deque::{Injector, Steal};
-use r2d2_redis::r2d2::{Pool, PooledConnection};
-use r2d2_redis::{r2d2, redis::Commands, redis::Value, RedisConnectionManager};
 use rayon::prelude::*;
+use redis::{Commands, Value};
 use tokio::sync::watch::Receiver;
 use tonic::Response;
 use tracing::{debug, error, info, warn};
@@ -17,7 +16,7 @@ pub type RateLimitConfigs = HashMap<String, Vec<Descriptor>>;
 
 pub struct Steward {
     rx: Receiver<RateLimitConfigs>,
-    pool: Pool<RedisConnectionManager>,
+    pool: r2d2::Pool<redis::Client>,
     ttl: usize,
 }
 
@@ -28,7 +27,7 @@ impl Steward {
         rx: Receiver<RateLimitConfigs>,
         pool_size: usize,
     ) -> Self {
-        let manager = RedisConnectionManager::new(format!("redis://{redis_host}")).unwrap();
+        let manager = redis::Client::open(format!("redis://{redis_host}")).unwrap();
         let pool = r2d2::Pool::builder()
             .max_size(pool_size as u32)
             .build(manager)
@@ -77,17 +76,10 @@ fn collect_rate_limit_entries(
         let limit_override = descriptor.limit.as_ref().map(RateLimit::from);
 
         for entry in descriptor.entries.iter() {
-            let key = format!("{}_{}_{}", &request.domain, entry.key, entry.value);
+            let key = create_descriptor_key(&request.domain, &entry.key, &entry.value);
             for limit in rate_limits.iter() {
                 let requests_per_unit = limit.rate_limit.requests_per_unit;
-                let config_key = format!(
-                    "{}_{}_{}_{}_{}",
-                    &request.domain,
-                    limit.key,
-                    limit.value,
-                    requests_per_unit,
-                    limit.rate_limit.unit.clone() as i32
-                );
+                let config_key = create_rl_config_key(&request.domain, limit, requests_per_unit);
                 if config_key.starts_with(&key) {
                     debug!("Rate limit config matches descriptor entry: {config_key}");
                     if let Some(override_) = limit_override.clone() {
@@ -105,9 +97,9 @@ fn collect_rate_limit_entries(
 
 fn create_descriptor_key(domain: &str, key: &str, value: &str) -> String {
     let mut result = String::with_capacity(domain.len() + key.len() + value.len());
-    result.push_str(&domain);
-    result.push_str(&key);
-    result.push_str(&value);
+    result.push_str(domain);
+    result.push_str(key);
+    result.push_str(value);
     result
 }
 
@@ -119,7 +111,7 @@ fn create_rl_config_key(domain: &str, limit: &Descriptor, requests_per_unit: i64
             + requests_per_unit.to_string().len()
             + 5,
     );
-    result.push_str(&domain);
+    result.push_str(domain);
     result.push_str(&limit.key);
     result.push_str(&limit.value);
     result.push_str(&requests_per_unit.to_string());
@@ -139,34 +131,7 @@ impl RateLimitService for Steward {
             debug!("Loaded rate limits from config source");
             let mut entries = HashMap::with_capacity(request.descriptors.len());
 
-            debug!("Reading descriptor entries from request");
-            for descriptor in request.descriptors.iter() {
-                debug!("Descriptor: {descriptor:?}");
-
-                let limit_override = descriptor.limit.as_ref().map(RateLimit::from);
-
-                for entry in descriptor.entries.iter() {
-                    let key = create_descriptor_key(&request.domain, &entry.key, &entry.value);
-                    for limit in rate_limits.iter() {
-                        let requests_per_unit = limit.rate_limit.requests_per_unit;
-
-                        let config_key =
-                            create_rl_config_key(&request.domain, limit, requests_per_unit);
-
-                        if config_key.starts_with(&key) {
-                            debug!("Rate limit config matches descriptor entry: {config_key}");
-                            let entry = if let Some(override_) = limit_override.as_ref() {
-                                override_.clone()
-                            } else {
-                                limit.rate_limit.to_owned()
-                            };
-                            entries.insert(config_key, entry);
-                        } else {
-                            debug!("{key} did not match {config_key}");
-                        }
-                    }
-                }
-            }
+            collect_rate_limit_entries(&request, rate_limits.to_vec(), &mut entries);
 
             let mut results = HashMap::with_capacity(entries.len());
             let injector = Injector::new();

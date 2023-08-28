@@ -16,8 +16,8 @@ socket2 = { version = "0.4", features = ["all"] }
 reqwest = { version = "0.11", features = ["json"] }
 
 # Database
-redis = { version = "0.22", features = ["tokio-comp", "r2d2"] }
-r2d2_redis = "0.14"
+redis = { version = "0.23", features = ["tokio-comp", "r2d2"] }
+r2d2 = "0.8"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

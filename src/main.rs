@@ -49,8 +49,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 ConfigSource::Http(url) => {
                     let u = url.as_str().try_into().unwrap();
-                    if let Ok(conf) = get_http_config(u).await {
-                        let _ = tx.send(conf);
+                    match get_http_config(u).await {
+                        Ok(conf) => {
+                            let _ = tx.send(conf);
+                        }
+                        Err(_) => todo!(),
                     }
                 }
             }
