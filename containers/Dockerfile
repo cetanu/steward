@@ -12,7 +12,6 @@ RUN rm -f src/main.rs
 
 # Build protobufs + binary
 COPY build.rs build.rs
-COPY proto proto
 COPY src src
 RUN cargo build
 COPY containers/steward.yaml steward.yaml
