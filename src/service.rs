@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crossbeam::deque::{Injector, Steal};
-use r2d2_redis::r2d2::Pool;
+use r2d2_redis::r2d2::{Pool, PooledConnection};
 use r2d2_redis::{r2d2, redis::Commands, redis::Value, RedisConnectionManager};
 use rayon::prelude::*;
 use tokio::sync::watch::Receiver;
@@ -42,23 +42,89 @@ impl Steward {
     }
 
     fn increment_entry(&self, key: &str, hits: &u32, interval: Option<usize>) -> i64 {
-        let mut conn = self.pool.get().unwrap();
         let mut current_rate = 0;
-        let interval = interval.unwrap_or(self.ttl);
-        let incremented_value = conn.incr(key, hits.to_owned());
-        if let Ok(Value::Int(n)) = incremented_value {
-            current_rate = n;
-        }
-        // Key was created, because 1 means that INCR was performed on either 0 or null key
-        // Therefore, we should set it to expire
-        if current_rate == 1 {
-            match conn.expire::<&str, u64>(key, interval) {
-                Err(e) => error!("Failed to set expiry for key: {e}"),
-                Ok(_) => debug!("Set expiry for key to {interval}"),
+        match self.pool.get() {
+            Ok(mut conn) => {
+                let interval = interval.unwrap_or(self.ttl);
+                let incremented_value = conn.incr(key, hits.to_owned());
+                if let Ok(Value::Int(n)) = incremented_value {
+                    current_rate = n;
+                }
+                // Key was created, because 1 means that INCR was performed on either 0 or null key
+                // Therefore, we should set it to expire
+                if current_rate == 1 {
+                    match conn.expire::<&str, u64>(key, interval) {
+                        Err(e) => error!("Failed to set expiry for key: {e}"),
+                        Ok(_) => debug!("Set expiry for key to {interval}"),
+                    }
+                }
             }
+            Err(e) => error!("Failed to acquire database connection: {e}"),
         }
         current_rate
     }
+}
+
+fn collect_rate_limit_entries(
+    request: &RateLimitRequest,
+    rate_limits: Vec<Descriptor>,
+    entries: &mut HashMap<String, RateLimit>,
+) {
+    debug!("Reading descriptor entries from request");
+    for descriptor in request.descriptors.iter() {
+        debug!("Descriptor: {descriptor:?}");
+
+        let limit_override = descriptor.limit.as_ref().map(RateLimit::from);
+
+        for entry in descriptor.entries.iter() {
+            let key = format!("{}_{}_{}", &request.domain, entry.key, entry.value);
+            for limit in rate_limits.iter() {
+                let requests_per_unit = limit.rate_limit.requests_per_unit;
+                let config_key = format!(
+                    "{}_{}_{}_{}_{}",
+                    &request.domain,
+                    limit.key,
+                    limit.value,
+                    requests_per_unit,
+                    limit.rate_limit.unit.clone() as i32
+                );
+                if config_key.starts_with(&key) {
+                    debug!("Rate limit config matches descriptor entry: {config_key}");
+                    if let Some(override_) = limit_override.clone() {
+                        entries.insert(config_key, override_);
+                    } else {
+                        entries.insert(config_key, limit.rate_limit.to_owned());
+                    }
+                } else {
+                    debug!("{key} did not match {config_key}");
+                }
+            }
+        }
+    }
+}
+
+fn create_descriptor_key(domain: &str, key: &str, value: &str) -> String {
+    let mut result = String::with_capacity(domain.len() + key.len() + value.len());
+    result.push_str(&domain);
+    result.push_str(&key);
+    result.push_str(&value);
+    result
+}
+
+fn create_rl_config_key(domain: &str, limit: &Descriptor, requests_per_unit: i64) -> String {
+    let mut result = String::with_capacity(
+        domain.len()
+            + limit.key.len()
+            + limit.value.len()
+            + requests_per_unit.to_string().len()
+            + 5,
+    );
+    result.push_str(&domain);
+    result.push_str(&limit.key);
+    result.push_str(&limit.value);
+    result.push_str(&requests_per_unit.to_string());
+    result.push_str(&(limit.rate_limit.unit.clone() as i32).to_string());
+    result
 }
 
 #[tonic::async_trait]
@@ -80,24 +146,21 @@ impl RateLimitService for Steward {
                 let limit_override = descriptor.limit.as_ref().map(RateLimit::from);
 
                 for entry in descriptor.entries.iter() {
-                    let key = format!("{}_{}_{}", &request.domain, entry.key, entry.value);
+                    let key = create_descriptor_key(&request.domain, &entry.key, &entry.value);
                     for limit in rate_limits.iter() {
                         let requests_per_unit = limit.rate_limit.requests_per_unit;
-                        let config_key = format!(
-                            "{}_{}_{}_{}_{}",
-                            &request.domain,
-                            limit.key,
-                            limit.value,
-                            requests_per_unit,
-                            limit.rate_limit.unit.clone() as i32
-                        );
+
+                        let config_key =
+                            create_rl_config_key(&request.domain, limit, requests_per_unit);
+
                         if config_key.starts_with(&key) {
                             debug!("Rate limit config matches descriptor entry: {config_key}");
-                            if let Some(override_) = limit_override.clone() {
-                                entries.insert(config_key, override_);
+                            let entry = if let Some(override_) = limit_override.as_ref() {
+                                override_.clone()
                             } else {
-                                entries.insert(config_key, limit.rate_limit.to_owned());
-                            }
+                                limit.rate_limit.to_owned()
+                            };
+                            entries.insert(config_key, entry);
                         } else {
                             debug!("{key} did not match {config_key}");
                         }
@@ -126,7 +189,7 @@ impl RateLimitService for Steward {
             for (entry_key, limit) in entries.iter() {
                 debug!("Checking if {entry_key} should rate limit");
                 let requests_per_unit = limit.requests_per_unit;
-                let rate = results.get(entry_key).unwrap();
+                let rate = results.get(entry_key).unwrap_or(&0);
                 info!(
                     "Checking if rate ({rate}) is over limit ({requests_per_unit}) for {entry_key}"
                 );
