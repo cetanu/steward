@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use zip::ZipArchive;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -109,6 +109,7 @@ fn download_protobufs(packages: Vec<Package>) {
                 let mut zf = File::create(archive).expect("Unable to create zip file");
                 let content = client
                     .get(package.url)
+                    .timeout(Duration::from_secs(180))
                     .send()
                     .expect("Failed to fetch package URL")
                     .bytes()
