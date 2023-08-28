@@ -53,7 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Ok(conf) => {
                             let _ = tx.send(conf);
                         }
-                        Err(_) => todo!(),
+                        Err(e) => panic!("Failed to get config from http: {e}"),
                     }
                 }
             }
