@@ -1,6 +1,6 @@
 use rayon::prelude::*;
 use regex::Regex;
-use reqwest::blocking::get;
+use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::Write;
@@ -104,9 +104,12 @@ fn download_protobufs(packages: Vec<Package>) {
             );
         } else {
             if !archive.exists() {
+                let client = Client::new();
                 println!("Downloading {package_name} protocol buffers from Github");
                 let mut zf = File::create(archive).expect("Unable to create zip file");
-                let content = get(package.url)
+                let content = client
+                    .get(package.url)
+                    .send()
                     .expect("Failed to fetch package URL")
                     .bytes()
                     .expect("Failed to read package URL bytes");
