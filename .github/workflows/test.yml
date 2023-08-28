@@ -39,3 +39,7 @@ jobs:
 
       - name: Run docker integration tests
         run: make test
+
+      - name: Inspect logs on failed run
+        if: failure()
+        run: make logs
