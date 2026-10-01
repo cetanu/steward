@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use reqwest::{Client, StatusCode};
-use tokio::time::{sleep, Instant};
+use tokio::time::{Instant, sleep};
 
 const ENVOY_URL: &str = "http://127.0.0.1:8080/headers";
 
@@ -22,7 +22,11 @@ async fn envoy_allows_requests_then_returns_rate_limit_response() {
 
     let mut response = None;
     for _ in 0..30 {
-        let result = client.get(ENVOY_URL).send().await.expect("request to Envoy");
+        let result = client
+            .get(ENVOY_URL)
+            .send()
+            .await
+            .expect("request to Envoy");
         if result.status() == StatusCode::TOO_MANY_REQUESTS {
             response = Some(result);
             break;
