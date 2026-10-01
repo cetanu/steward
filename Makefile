@@ -1,28 +1,30 @@
+COMPOSE ?= docker compose
+
 clean:
-	docker-compose down --rmi local -v --remove-orphans -t 1
+	$(COMPOSE) down --rmi local -v --remove-orphans --timeout 1
 
 daemonize:
-	docker-compose up --detach --force-recreate --build server envoy
+	$(COMPOSE) up --detach --force-recreate --build server envoy
 
 tavern:
-	docker-compose build tavern
-	docker-compose run --rm tavern
+	$(COMPOSE) build tavern
+	$(COMPOSE) run --rm tavern
 
 logs:
-	docker-compose logs server
+	$(COMPOSE) logs server
 
 run: clean
-	docker-compose up --detach --build envoy
-	docker-compose up --build --force-recreate server
+	$(COMPOSE) up --detach --build envoy
+	$(COMPOSE) up --build --force-recreate server
 
 watch-envoy:
-	docker-compose up --build envoy \
-		&& docker-compose logs --no-log-prefix --no-color --follow envoy \
+	$(COMPOSE) up --build envoy \
+		&& $(COMPOSE) logs --no-log-prefix --no-color --follow envoy \
 		| jq --sort-keys -R 'fromjson?'
 
 
 pcap-redis:
-	docker run -v `pwd`:/tmp/pcap -it --rm --net container:limiter_server_1 nicolaka/netshoot tcpdump -n -w /tmp/pcap/capture.pcap port 6379
+	docker run -v "$$(pwd)":/tmp/pcap -it --rm --net container:steward-server-1 nicolaka/netshoot tcpdump -n -w /tmp/pcap/capture.pcap port 6379
 
 
 test: daemonize tavern

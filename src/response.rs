@@ -1,5 +1,5 @@
-use crate::proto::envoy::service::ratelimit::v3::rate_limit_response::Code;
 use crate::proto::envoy::service::ratelimit::v3::RateLimitResponse;
+use crate::proto::envoy::service::ratelimit::v3::rate_limit_response::Code;
 
 pub fn limit_response(over: bool) -> RateLimitResponse {
     let code = match over {
