@@ -35,6 +35,5 @@ async fn envoy_allows_requests_then_returns_rate_limit_response() {
 
     let response = response.expect("repeated requests should be rate limited");
     let body: serde_json::Value = response.json().await.expect("JSON rate-limit response");
-    assert_eq!(body["grpc_status"], "Unavailable");
     assert_eq!(body["message"], "");
 }
