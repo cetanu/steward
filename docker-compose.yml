@@ -18,7 +18,6 @@ services:
     links:
       - server
       - httpbin
-    working_dir: /app
     ports:
       - 9901:9901
       - 80:8080
