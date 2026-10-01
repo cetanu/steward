@@ -20,7 +20,7 @@ services:
       - httpbin
     ports:
       - 9901:9901
-      - 80:8080
+      - 8080:8080
     expose:
       - 9901
       - 80
