@@ -39,6 +39,10 @@ tracing-subscriber = { version = "0.3.23", features = ["json", "env-filter"] }
 # Metrics
 cadence = "1.8.0"
 
+[dev-dependencies]
+reqwest = { version = "0.13.5", features = ["json"] }
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "time"] }
+
 [build-dependencies]
 tonic-prost-build = "0.14.6"
 regex = "1.12"

@@ -6,10 +6,6 @@ clean:
 daemonize:
 	$(COMPOSE) up --detach --force-recreate --build server envoy
 
-tavern:
-	$(COMPOSE) build tavern
-	$(COMPOSE) run --rm tavern
-
 logs:
 	$(COMPOSE) logs server
 
@@ -27,4 +23,5 @@ pcap-redis:
 	docker run -v "$$(pwd)":/tmp/pcap -it --rm --net container:steward-server-1 nicolaka/netshoot tcpdump -n -w /tmp/pcap/capture.pcap port 6379
 
 
-test: daemonize tavern
+test: daemonize
+	cargo test --test rate_limit

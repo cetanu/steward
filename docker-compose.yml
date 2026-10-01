@@ -37,15 +37,6 @@ services:
     expose:
       - 6379
 
-  tavern:
-    build:
-      context: containers
-      dockerfile: tavern.Dockerfile
-    volumes:
-      - ./test-reports:/proj/test-reports:delegated
-    links:
-      - envoy
-
   mock_config:
     build:
       context: containers
