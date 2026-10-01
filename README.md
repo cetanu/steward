@@ -43,9 +43,8 @@ database, a mock configuration server, and a httpbin backend.
 
 ### Running tests
 
-The project uses tavern HTTP integration tests.  
-They can be executed with `make test`. Rust unit tests run with
-`cargo test`.
+The project uses Rust HTTP integration tests against the Docker Compose
+environment. Run them with `make test`. Rust unit tests run with `cargo test`.
 
 
 Configuration
