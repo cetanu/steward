@@ -6,3 +6,4 @@ rate_limit_configs:
 redis_host: redis
 redis_connections: 8
 default_ttl: 10
+config_refresh_interval_secs: 60
