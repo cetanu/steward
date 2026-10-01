@@ -11,6 +11,8 @@ Features
 ------------------------------------------------------------
 
 * Load rate limit configs from HTTP or a local file
+* Redis-backed fixed-window, token-bucket, and sliding-window rate limiting
+* Optional StatsD metrics over UDP
 
 
 Building and testing
@@ -24,12 +26,12 @@ Building and testing
 
 ### Optional prerequisites for building locally
 
-* Rust toolchain
+* Rust toolchain 1.88 or newer
 
 
 ### Building locally
 
-Simple execute `cargo build --release` to create a binary
+Simply execute `cargo build --release` to create a binary
 which, when run, will start the rate limit service as a
 gRPC server.
 
@@ -42,7 +44,8 @@ database, a mock configuration server, and a httpbin backend.
 ### Running tests
 
 The project uses tavern HTTP integration tests.  
-They can be executed with `make test`
+They can be executed with `make test`. Rust unit tests run with
+`cargo test`.
 
 
 Configuration
@@ -64,6 +67,7 @@ rate_limit_configs:
 redis_host: redis
 redis_connections: 8
 default_ttl: 10
+config_refresh_interval_secs: 60
 ```
 
 ### `rate_limit_configs`
@@ -91,3 +95,47 @@ Example of what the service expects the location to contain:
 ```
 
 There can be any number of domains and descriptors.
+
+### Rate-limit algorithms
+
+Each descriptor defaults to the backwards-compatible fixed window algorithm.
+Set `algorithm` to `fixed_window`, `token_bucket`, or `sliding_window` for a
+different policy:
+
+```json
+{
+  "api": [
+    {
+      "key": "client",
+      "value": "example",
+      "rate_limit": {
+        "algorithm": "token_bucket",
+        "unit": "seconds",
+        "requests_per_unit": 20
+      }
+    }
+  ]
+}
+```
+
+The token bucket uses `requests_per_unit` as both its burst capacity and its
+refill rate over the selected unit. Sliding-window state is maintained as a
+Redis sorted set. Redis updates are atomic, and a request that exactly reaches
+the limit is allowed.
+
+### StatsD metrics
+
+Metrics are disabled unless configured. The sink uses a queued UDP client so
+metric delivery does not block rate-limit checks:
+
+```yaml
+metrics:
+  statsd:
+    address: statsd:8125
+    prefix: steward
+    queue_capacity: 1024
+```
+
+The service emits request totals, allowed/over-limit counts, configuration
+reload/error counts, Redis errors and operation latency, plus the observed
+rate-limit value.

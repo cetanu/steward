@@ -12,6 +12,11 @@
 [x] descriptive logs  
 [x] figure out how to allow multiple ttls  
 [x] figure out how to scale RPS per unit (in service.rs)  
-[x] FIXME: multiple rate limit configs with the same descriptor  
-    key/value conflict with each other  
-[ ] metrics  
+[x] support multiple rate limit configs with the same descriptor key/value
+[x] metrics
+[x] configurable fixed-window, token-bucket, and sliding-window algorithms
+
+Open follow-ups:
+
+* Add a readiness/health endpoint for Redis and the configuration source.
+* Decide whether Redis failures should remain fail-open or become configurable.
