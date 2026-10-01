@@ -52,9 +52,19 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes protobuf-compiler
+
       - name: Run integration tests
         run: make test
 
       - name: Show server logs on failure
         if: failure()
         run: make logs
+
+      - name: Stop Docker environment
+        if: always()
+        run: make clean
