@@ -16,7 +16,7 @@ struct Package<'a> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Which Envoy protos to use
-    let envoy_version = "1.25.0";
+    let envoy_version = "1.39.0";
     let envoy_url =
         format!("https://github.com/envoyproxy/envoy/archive/refs/tags/v{envoy_version}.zip");
     let envoy_directory = format!("envoy-{envoy_version}/api");
