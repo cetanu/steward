@@ -18,63 +18,9 @@ use crate::response::limit_response;
 
 pub type RateLimitConfigs = HashMap<String, Vec<Descriptor>>;
 
-const FIXED_WINDOW_SCRIPT: &str = r#"
-local current = redis.call('INCRBY', KEYS[1], ARGV[1])
-if current == tonumber(ARGV[1]) then
-  redis.call('EXPIRE', KEYS[1], ARGV[2])
-end
-return current
-"#;
-
-const TOKEN_BUCKET_SCRIPT: &str = r#"
-local now = tonumber(ARGV[1])
-local capacity = tonumber(ARGV[2])
-local refill_per_ms = tonumber(ARGV[3])
-local cost = tonumber(ARGV[4])
-local window_ms = tonumber(ARGV[5])
-local state = redis.call('HMGET', KEYS[1], 'tokens', 'timestamp_ms')
-local tokens = tonumber(state[1])
-local last = tonumber(state[2])
-
-if tokens == nil then
-  tokens = capacity
-  last = now
-else
-  tokens = math.min(capacity, tokens + math.max(0, now - last) * refill_per_ms)
-end
-
-local allowed = 0
-if tokens >= cost then
-  tokens = tokens - cost
-  allowed = 1
-end
-
-redis.call('HSET', KEYS[1], 'tokens', tokens, 'timestamp_ms', now)
-redis.call('PEXPIRE', KEYS[1], window_ms * 2)
-return { allowed, math.floor(tokens) }
-"#;
-
-const SLIDING_WINDOW_SCRIPT: &str = r#"
-local now = tonumber(ARGV[1])
-local window_ms = tonumber(ARGV[2])
-local limit = tonumber(ARGV[3])
-local hits = tonumber(ARGV[4])
-local nonce = ARGV[5]
-
-redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, now - window_ms)
-local current = redis.call('ZCARD', KEYS[1])
-local allowed = 0
-if current + hits <= limit then
-  for i = 1, hits do
-    redis.call('ZADD', KEYS[1], now, nonce .. '-' .. i)
-  end
-  current = current + hits
-  allowed = 1
-end
-
-redis.call('PEXPIRE', KEYS[1], window_ms * 2)
-return { allowed, current }
-"#;
+const FIXED_WINDOW_SCRIPT: &str = include_str!("scripts/fixed_window.lua");
+const TOKEN_BUCKET_SCRIPT: &str = include_str!("scripts/token_bucket.lua");
+const SLIDING_WINDOW_SCRIPT: &str = include_str!("scripts/sliding_window.lua");
 
 static REQUEST_NONCE: AtomicU64 = AtomicU64::new(0);
 
