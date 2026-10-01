@@ -24,4 +24,4 @@ pcap-redis:
 
 
 test: daemonize
-	cargo test --test rate_limit
+	cargo test --locked --test rate_limit
