@@ -34,9 +34,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             directory: "googleapis-master",
         },
         Package {
-            url: "https://github.com/envoyproxy/protoc-gen-validate/archive/main.zip",
+            url: "https://github.com/protocolbuffers/protobuf/archive/refs/tags/v3.21.12.zip",
+            namespaces: vec![("google/protobuf", "google/protobuf")]
+                .into_iter()
+                .collect(),
+            directory: "protobuf-3.21.12/src",
+        },
+        Package {
+            url: "https://github.com/bufbuild/protoc-gen-validate/archive/refs/tags/v1.3.3.zip",
             namespaces: vec![("validate", "validate")].into_iter().collect(),
-            directory: "protoc-gen-validate-main",
+            directory: "protoc-gen-validate-1.3.3",
         },
         Package {
             url: "https://github.com/census-instrumentation/opencensus-proto/archive/refs/tags/v0.2.0.zip",
