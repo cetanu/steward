@@ -1,4 +1,3 @@
-use rayon::prelude::*;
 use regex::Regex;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
@@ -26,37 +25,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let packages = vec![
         Package {
             url: &envoy_url,
-            namespaces: vec![("envoy", "envoy")]
-                .into_iter()
-                .collect(),
+            namespaces: vec![("envoy", "envoy")].into_iter().collect(),
             directory: &envoy_directory,
         },
         Package {
             url: "https://github.com/googleapis/googleapis/archive/master.zip",
-            namespaces: vec![("google", "google")]
-                .into_iter()
-                .collect(),
+            namespaces: vec![("google", "google")].into_iter().collect(),
             directory: "googleapis-master",
         },
-        Package{
-            url:"https://github.com/envoyproxy/protoc-gen-validate/archive/main.zip",
+        Package {
+            url: "https://github.com/envoyproxy/protoc-gen-validate/archive/main.zip",
             namespaces: vec![("validate", "validate")].into_iter().collect(),
-            directory:"protoc-gen-validate-main",
+            directory: "protoc-gen-validate-main",
         },
-        Package{
-            url:"https://github.com/census-instrumentation/opencensus-proto/archive/refs/tags/v0.2.0.zip",
+        Package {
+            url: "https://github.com/census-instrumentation/opencensus-proto/archive/refs/tags/v0.2.0.zip",
             namespaces: vec![("opencensus", "opencensus")].into_iter().collect(),
-            directory:"opencensus-proto-0.2.0/src",
+            directory: "opencensus-proto-0.2.0/src",
         },
-        Package{
-            url:"https://github.com/prometheus/client_model/archive/refs/tags/v0.2.0.zip",
+        Package {
+            url: "https://github.com/prometheus/client_model/archive/refs/tags/v0.2.0.zip",
             namespaces: vec![(".", "prometheus")].into_iter().collect(),
-            directory:"client_model-0.2.0",
+            directory: "client_model-0.2.0",
         },
-        Package{
-            url:"https://github.com/cncf/xds/archive/refs/heads/main.zip",
+        Package {
+            url: "https://github.com/cncf/xds/archive/refs/heads/main.zip",
             namespaces: vec![("xds", "xds"), ("udpa", "udpa")].into_iter().collect(),
-            directory:"xds-main",
+            directory: "xds-main",
         },
     ];
 
@@ -72,9 +67,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     download_protobufs(packages);
 
     // Compile protocol buffers
-    tonic_build::configure()
+    tonic_prost_build::configure()
         .build_client(false)
-        .compile(&["envoy/service/ratelimit/v3/rls.proto"], &["."])?;
+        .disable_comments(["."])
+        .compile_protos(&["envoy/service/ratelimit/v3/rls.proto"], &["."])?;
     Ok(())
 }
 
@@ -82,7 +78,7 @@ fn download_protobufs(packages: Vec<Package>) {
     let pattern = r"github\.com/[a-zA-Z0-9-_]+/(?P<name>[a-zA-Z0-9-_]+)";
     let repo_name_pattern = Regex::new(pattern).unwrap();
 
-    packages.par_iter().for_each(|package| {
+    for package in packages {
         let package_name: String = repo_name_pattern
             .captures_iter(package.url)
             .take(1)
@@ -123,17 +119,17 @@ fn download_protobufs(packages: Vec<Package>) {
                 .expect("Unable to read zip archive");
             for i in 0..zip.len() {
                 let mut file = zip.by_index(i).expect("Unable to access zip file by index");
-                if file.name().ends_with(".proto") {
+                let file_name = file.name().expect("Unable to read zip entry name");
+                if file_name.ends_with(".proto") {
                     // println!("Extracting {}", file.name());
-                    let outpath = file.mangled_name();
-                    if file.name().ends_with('/') {
+                    let outpath = file.mangled_name().expect("Unable to read zip entry path");
+                    if file_name.ends_with('/') {
                         fs::create_dir_all(&outpath).expect("Unable to create directory");
                     } else {
-                        if let Some(parent) = outpath.parent() {
-                            if !parent.exists() {
-                                fs::create_dir_all(parent)
-                                    .expect("Unable to create parent directory");
-                            }
+                        if let Some(parent) = outpath.parent()
+                            && !parent.exists()
+                        {
+                            fs::create_dir_all(parent).expect("Unable to create parent directory");
                         }
                         let mut outfile =
                             File::create(&outpath).expect("Unable to create output file");
@@ -204,5 +200,5 @@ fn download_protobufs(packages: Vec<Package>) {
             fs::write(keep, format!("Last downloaded: {timestamp:?}"))
                 .expect("Unable to write keep file");
         }
-    });
+    }
 }
