@@ -11,10 +11,10 @@ async fn envoy_allows_requests_then_returns_rate_limit_response() {
     let deadline = Instant::now() + Duration::from_secs(60);
 
     loop {
-        if let Ok(response) = client.get(ENVOY_URL).send().await {
-            if response.status().is_success() {
-                break;
-            }
+        if let Ok(response) = client.get(ENVOY_URL).send().await
+            && response.status().is_success()
+        {
+            break;
         }
         assert!(Instant::now() < deadline, "Envoy did not become ready");
         sleep(Duration::from_millis(250)).await;

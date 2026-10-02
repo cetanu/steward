@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 
+authors = ["Vasilios Syrakis <syrakis@pm.me>"]
+description = "High-performance Envoy rate-limit service in Rust"
+repository = "https://github.com/cetanu/steward"
+license = "MIT"
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
@@ -50,3 +55,10 @@ zip = "9.0.0-pre3"
 fs_extra = "1.3"
 reqwest = { version = "0.13.5", features = ["blocking"] }
 serde = { version = "1.0", features = ["derive"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
