@@ -13,7 +13,7 @@ daemonize-prebuilt: build
 	$(COMPOSE) -f docker-compose.yml -f docker-compose.prebuilt.yml up --detach --force-recreate --build server envoy
 
 logs:
-	$(COMPOSE) logs server
+	$(COMPOSE) logs server envoy
 
 run: clean
 	$(COMPOSE) up --detach --build envoy
