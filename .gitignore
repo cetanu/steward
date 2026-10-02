@@ -1,3 +1,7 @@
 /target
 /proto
 /test-reports
+/release
+*.tar.gz
+*.sha256
+.DS_Store

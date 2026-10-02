@@ -4,67 +4,222 @@ on:
   push:
     branches: [main]
   pull_request:
+    branches: [main]
   workflow_dispatch:
-
-permissions:
-  contents: read
-
-concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+    inputs:
+      release_tag:
+        description: Existing draft release tag to build, publish, and deploy
+        required: true
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
 
+permissions: {}
+
 jobs:
-  rust:
-    name: Rust checks
+  commitlint:
+    name: Lint commit messages
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check pull-request commits
+        if: github.event_name == 'pull_request'
+        uses: amannn/action-semantic-pull-request@v5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Check pushed commits
+        if: github.event_name == 'push'
+        uses: webiny/action-conventional-commits@v1.3.0
+
+  audit:
+    name: Audit dependencies
     runs-on: ubuntu-latest
     steps:
-      - name: Check out source
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.release_tag) || github.sha }}
+          persist-credentials: false
+      - uses: taiki-e/install-action@cargo-audit
+      - run: cargo audit
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+  check:
+    name: Check and lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.release_tag) || github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-
       - name: Install protobuf compiler
         run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes protobuf-compiler
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
-      - name: Cache Rust build
-        uses: Swatinem/rust-cache@v2
-
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-      - name: Run Clippy
-        run: cargo clippy --locked --all-targets --all-features -- -D warnings
-
+  test:
+    name: Test release (${{ matrix.arch }})
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-22.04
+          - arch: aarch64
+            runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.release_tag) || github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes protobuf-compiler
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binary
+        run: cargo build --release --locked --bin steward
       - name: Run unit tests
-        run: cargo test --locked --lib --bins
+        run: cargo test --release --locked --lib --bins
+      - name: Package tested release
+        run: |
+          mkdir release
+          cp target/release/steward release/steward
+          tar -C release -czf "steward-${{ matrix.arch }}.tar.gz" .
+          sha256sum "steward-${{ matrix.arch }}.tar.gz" > "steward-${{ matrix.arch }}.tar.gz.sha256"
+      - name: Preserve tested release
+        uses: actions/upload-artifact@v4
+        with:
+          name: steward-${{ matrix.arch }}
+          path: |
+            steward-${{ matrix.arch }}.tar.gz
+            steward-${{ matrix.arch }}.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 1
 
   integration:
     name: Docker integration tests
+    needs: [check, test]
     runs-on: ubuntu-latest
-    needs: rust
     steps:
-      - name: Check out source
-        uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.release_tag) || github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
       - name: Install protobuf compiler
         run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes protobuf-compiler
-
+      - uses: Swatinem/rust-cache@v2
+      - name: Download tested Linux x86_64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: steward-x86_64
+          path: release
+      - name: Unpack tested binary
+        run: |
+          tar -xzf release/steward-x86_64.tar.gz -C release
+          mkdir -p target/release
+          cp release/steward target/release/steward
       - name: Run integration tests
-        run: make test
-
+        run: make test-prebuilt
       - name: Show server logs on failure
         if: failure()
         run: make logs
-
       - name: Stop Docker environment
         if: always()
         run: make clean
+
+  release:
+    name: Create draft release
+    needs: [commitlint, audit, check, test, integration]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+    permissions:
+      contents: write
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - id: release-plz
+        uses: release-plz/action@v0.5
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Get released tag
+        id: release
+        env:
+          RELEASES: ${{ steps.release-plz.outputs.releases }}
+        run: |
+          tag="$(jq -r '.[0].tag // empty' <<< "$RELEASES")"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  release-pr:
+    name: Prepare release pull request
+    needs: [commitlint, audit, check, test, integration]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    concurrency:
+      group: release-plz-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: release-plz/action@v0.5
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  upload-binary:
+    name: Upload tested Linux binaries
+    needs: [release, test, integration]
+    if: always() && needs.test.result == 'success' && needs.integration.result == 'success' && (needs.release.outputs.tag != '' || github.event.inputs.release_tag != '')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download tested releases
+        uses: actions/download-artifact@v4
+        with:
+          pattern: steward-*
+          merge-multiple: true
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.release.outputs.tag || github.event.inputs.release_tag }}
+          REPOSITORY: ${{ github.repository }}
+        run: gh release upload "$RELEASE_TAG" steward-*.tar.gz steward-*.tar.gz.sha256 --clobber --repo "$REPOSITORY"
+
+  publish-release:
+    name: Publish GitHub release
+    needs: [release, upload-binary]
+    if: always() && needs.upload-binary.result == 'success' && (needs.release.outputs.tag != '' || github.event.inputs.release_tag != '')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.release.outputs.tag || github.event.inputs.release_tag }}
+          REPOSITORY: ${{ github.repository }}
+        run: gh release edit "$RELEASE_TAG" --repo "$REPOSITORY" --draft=false
