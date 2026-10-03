@@ -49,7 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (config_tx, config_rx) = watch::channel(initial_config);
 
-    spawn_config_loader(
+    let config_loader_handle = spawn_config_loader(
         settings.rate_limit_configs.clone(),
         std::time::Duration::from_secs(settings.config_refresh_interval_secs.max(1)),
         config_tx,
@@ -74,6 +74,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ))
     .with_max_concurrent_requests(settings.max_concurrent_requests);
 
+    let (health_reporter, health_service) = tonic_health::server::health_reporter();
+    health_reporter
+        .set_serving::<RateLimitServiceServer<Steward>>()
+        .await;
+    health_reporter
+        .set_service_status("", tonic_health::ServingStatus::Serving)
+        .await;
+
     let addr = SocketAddr::new(settings.listen.addr.into(), settings.listen.port);
     let socket = Socket::new(Domain::for_address(addr), Type::STREAM, None)?;
     socket.set_reuse_address(true)?;
@@ -84,7 +92,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::from_std(std::net::TcpListener::from(socket))?;
     let incoming = TcpListenerStream::new(listener);
 
-    info!(%addr, "starting Steward rate-limit service");
+    info!(%addr, "starting Steward rate-limit service with gRPC health checking");
     let mut server = Server::builder()
         .concurrency_limit_per_connection(1024)
         .tcp_keepalive(Some(std::time::Duration::from_secs(30)))
@@ -104,9 +112,75 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    server
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let health_reporter_clone = health_reporter.clone();
+
+    tokio::spawn(async move {
+        wait_for_shutdown_signal().await;
+
+        info!("initiating graceful shutdown: marking gRPC health as NOT_SERVING");
+        health_reporter_clone
+            .set_not_serving::<RateLimitServiceServer<Steward>>()
+            .await;
+        health_reporter_clone
+            .set_service_status("", tonic_health::ServingStatus::NotServing)
+            .await;
+
+        // Bounded drain pause: give Envoy/ingress 2 seconds to receive NOT_SERVING and reroute
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        let _ = shutdown_tx.send(());
+    });
+
+    let serve_future = server
+        .add_service(health_service)
         .add_service(RateLimitServiceServer::new(steward))
-        .serve_with_incoming(incoming)
-        .await?;
+        .serve_with_incoming_shutdown(incoming, async {
+            let _ = shutdown_rx.await;
+            info!("stopping listener and draining in-flight requests");
+        });
+
+    if let Err(e) = serve_future.await {
+        tracing::error!("server error: {e}");
+    }
+
+    info!("draining background tasks and flushing telemetry");
+    config_loader_handle.abort();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(1), config_loader_handle).await;
+
+    info!("Steward graceful shutdown complete");
     Ok(())
+}
+
+async fn wait_for_shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C signal handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(e) => {
+                tracing::warn!("failed to install SIGTERM signal handler: {e}");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {
+            tracing::info!("received SIGINT (Ctrl+C) shutdown signal");
+        }
+        _ = terminate => {
+            tracing::info!("received SIGTERM shutdown signal");
+        }
+    }
 }

@@ -15,6 +15,7 @@ license = "MIT"
 # gRPC
 tonic = { version = "0.14.6", features = ["transport", "tls-aws-lc"] }
 tonic-prost = "0.14.6"
+tonic-health = "0.14"
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = { version = "0.1.18", features = ["net"] }
 futures-util = "0.3"
