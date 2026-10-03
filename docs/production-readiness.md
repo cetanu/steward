@@ -363,7 +363,7 @@ Milestones are dependency ordered. Each should leave a deployable development pr
 
 ### M3 tasks — Establish production deployment and recovery
 
-- [ ] **M3.1:** Produce a non-root multi-stage release image, pin deploy/test artifacts and compiler identities, qualify the release image in CI, and add dependency/image scans plus an SBOM.
+- [x] **M3.1:** Produce a non-root multi-stage release image, pin deploy/test artifacts and compiler identities, qualify the release image in CI, and add dependency/image scans plus an SBOM.
 - [ ] **M3.2:** Establish authenticated Envoy-to-service traffic, Redis TLS/credentials, secure configuration access, private admin/backend ports, and secret rotation behavior. Replace `redis_host` with one validated complete URL.
 - [ ] **M3.3:** Implement health/readiness and bounded SIGTERM drain; supervise configuration and telemetry tasks. Add deployment startup/readiness/liveness probes and termination settings.
 - [ ] **M3.4:** Reuse/bound the configuration client, add refresh jitter and loader-health metrics, and document stale-policy/version-divergence behavior. Add conditional HTTP refresh if the chosen source supports it.

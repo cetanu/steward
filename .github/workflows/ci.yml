@@ -48,6 +48,28 @@ jobs:
       - uses: taiki-e/install-action@cargo-audit
       - run: cargo audit
 
+  sbom:
+    name: Generate SBOM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.release_tag) || github.sha }}
+          persist-credentials: false
+      - name: Generate CycloneDX SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: steward.sbom.cyclonedx.json
+      - name: Preserve SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: steward-sbom
+          path: steward.sbom.cyclonedx.json
+          if-no-files-found: error
+          retention-days: 1
+
   check:
     name: Check and lint
     runs-on: ubuntu-latest
@@ -56,8 +78,9 @@ jobs:
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.release_tag) || github.sha }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.88.0"
           components: rustfmt, clippy
       - name: Install protobuf compiler
         run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes protobuf-compiler
@@ -80,7 +103,9 @@ jobs:
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.release_tag) || github.sha }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88.0"
       - name: Install protobuf compiler
         run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes protobuf-compiler
       - uses: Swatinem/rust-cache@v2
@@ -113,7 +138,9 @@ jobs:
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.release_tag) || github.sha }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88.0"
       - name: Install protobuf compiler
         run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes protobuf-compiler
       - uses: Swatinem/rust-cache@v2
@@ -136,9 +163,35 @@ jobs:
         if: always()
         run: make clean
 
+  container-scan:
+    name: Container security scan
+    needs: [check, test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.release_tag) || github.sha }}
+          persist-credentials: false
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Build release container image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: containers/Dockerfile
+          load: true
+          tags: steward:local
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: steward:local
+          format: table
+          exit-code: 0
+          severity: CRITICAL,HIGH
+
   release:
     name: Create draft release
-    needs: [commitlint, audit, check, test, integration]
+    needs: [commitlint, audit, sbom, check, test, integration, container-scan]
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     outputs:
@@ -151,7 +204,9 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88.0"
       - id: release-plz
         uses: release-plz/action@v0.5
         with:
@@ -168,7 +223,7 @@ jobs:
 
   release-pr:
     name: Prepare release pull request
-    needs: [commitlint, audit, check, test, integration]
+    needs: [commitlint, audit, sbom, check, test, integration, container-scan]
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
@@ -182,7 +237,9 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88.0"
       - uses: release-plz/action@v0.5
         with:
           command: release-pr
@@ -190,14 +247,14 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   upload-binary:
-    name: Upload tested Linux binaries
-    needs: [release, test, integration]
+    name: Upload tested Linux binaries and SBOM
+    needs: [release, test, integration, sbom]
     if: always() && needs.test.result == 'success' && needs.integration.result == 'success' && (needs.release.outputs.tag != '' || github.event.inputs.release_tag != '')
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - name: Download tested releases
+      - name: Download tested releases and SBOM
         uses: actions/download-artifact@v4
         with:
           pattern: steward-*
@@ -207,7 +264,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.release.outputs.tag || github.event.inputs.release_tag }}
           REPOSITORY: ${{ github.repository }}
-        run: gh release upload "$RELEASE_TAG" steward-*.tar.gz steward-*.tar.gz.sha256 --clobber --repo "$REPOSITORY"
+        run: gh release upload "$RELEASE_TAG" steward-*.tar.gz steward-*.tar.gz.sha256 steward.sbom.cyclonedx.json --clobber --repo "$REPOSITORY"
 
   publish-release:
     name: Publish GitHub release
