@@ -11,12 +11,13 @@ use tonic::Response;
 use tracing::{debug, error, info, warn};
 
 use crate::metrics::{SharedMetrics, count, gauge, time};
+use crate::proto::envoy::service::ratelimit::v3::rate_limit_response::{Code, DescriptorStatus};
 use crate::proto::envoy::service::ratelimit::v3::rate_limit_service_server::RateLimitService;
 use crate::proto::envoy::service::ratelimit::v3::{RateLimitRequest, RateLimitResponse};
-use crate::rate_limits::{Algorithm, Descriptor, RateLimit};
-use crate::response::limit_response;
+use crate::rate_limits::{Algorithm, PolicyTrie, RateLimit, encode_canonical_path, rate_limit_key};
+use crate::response::{build_response, limit_response};
 
-pub type RateLimitConfigs = HashMap<String, Vec<Descriptor>>;
+pub type RateLimitConfigs = HashMap<String, PolicyTrie>;
 
 const FIXED_WINDOW_SCRIPT: &str = include_str!("scripts/fixed_window.lua");
 const TOKEN_BUCKET_SCRIPT: &str = include_str!("scripts/token_bucket.lua");
@@ -25,9 +26,18 @@ const SLIDING_WINDOW_SCRIPT: &str = include_str!("scripts/sliding_window.lua");
 static REQUEST_NONCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy)]
-struct Decision {
-    allowed: bool,
-    observed: i64,
+pub struct Decision {
+    pub allowed: bool,
+    pub observed: i64,
+}
+
+struct DescriptorMatch {
+    limits_to_check: Vec<(String, RateLimit)>,
+}
+
+enum DescriptorEvaluation {
+    Unmatched,
+    Matched(DescriptorMatch),
 }
 
 pub struct Steward {
@@ -166,47 +176,106 @@ fn now_millis() -> i64 {
         .as_millis() as i64
 }
 
-fn matching_rate_limits(
-    request: &RateLimitRequest,
-    configured_limits: &[Descriptor],
-) -> HashMap<String, RateLimit> {
-    let mut matches = HashMap::new();
-    for request_descriptor in &request.descriptors {
-        let override_ = request_descriptor.limit.as_ref();
-        for entry in &request_descriptor.entries {
-            for configured in configured_limits {
-                if configured.key != entry.key || configured.value != entry.value {
-                    continue;
-                }
-
-                let limit = override_
-                    .map(|override_| configured.rate_limit.with_override(override_))
-                    .unwrap_or_else(|| configured.rate_limit.clone());
-                if !limit.is_valid() {
-                    warn!(descriptor_key = %configured.key, descriptor_value = %configured.value, "ignoring invalid rate limit");
-                    continue;
-                }
-
-                matches.insert(rate_limit_key(&request.domain, configured, &limit), limit);
-            }
-        }
+pub fn duration_until_reset_for(limit: &RateLimit, default_ttl: usize) -> u64 {
+    let window_secs = limit.unit.seconds().unwrap_or(default_ttl as u64).max(1);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let rem = now % window_secs;
+    if rem == 0 {
+        window_secs
+    } else {
+        window_secs - rem
     }
-    matches
 }
 
-fn rate_limit_key(domain: &str, descriptor: &Descriptor, limit: &RateLimit) -> String {
-    format!(
-        "steward:rate:{}:{domain}:{}:{}:{}:{}:{}:{}:{}",
-        domain.len(),
-        descriptor.key.len(),
-        descriptor.key,
-        descriptor.value.len(),
-        descriptor.value,
-        limit.requests_per_unit,
-        limit.unit.as_str(),
-        // Keep state separate when an algorithm is changed in configuration.
-        limit.algorithm.as_str()
-    )
+pub fn limit_remaining_for(limit: &RateLimit, decision: &Decision) -> u32 {
+    match limit.algorithm {
+        Algorithm::FixedWindow | Algorithm::SlidingWindow => limit
+            .requests_per_unit
+            .saturating_sub(decision.observed)
+            .max(0) as u32,
+        Algorithm::TokenBucket => decision.observed.max(0) as u32,
+    }
+}
+
+pub fn aggregate_descriptor_status(
+    limit_decisions: &[(&RateLimit, &Decision)],
+    default_ttl: usize,
+) -> DescriptorStatus {
+    let any_over = limit_decisions.iter().any(|(_, dec)| !dec.allowed);
+
+    if any_over {
+        // Section 5.2 Rule 2: Over-Limit Status Governing Rule
+        // Select violated window with largest duration_until_reset (tie-breaker: shortest unit duration).
+        let mut violated: Vec<(&RateLimit, &Decision)> = limit_decisions
+            .iter()
+            .copied()
+            .filter(|(_, dec)| !dec.allowed)
+            .collect();
+
+        violated.sort_by(|(l1, _), (l2, _)| {
+            let reset1 = duration_until_reset_for(l1, default_ttl);
+            let reset2 = duration_until_reset_for(l2, default_ttl);
+            let unit_secs1 = l1.unit.seconds().unwrap_or(default_ttl as u64);
+            let unit_secs2 = l2.unit.seconds().unwrap_or(default_ttl as u64);
+
+            reset2
+                .cmp(&reset1)
+                .then_with(|| unit_secs1.cmp(&unit_secs2))
+        });
+
+        let (gov_limit, gov_decision) = violated[0];
+        let remaining = limit_remaining_for(gov_limit, gov_decision);
+        let reset_secs = duration_until_reset_for(gov_limit, default_ttl);
+
+        DescriptorStatus {
+            code: Code::OverLimit as i32,
+            current_limit: Some(gov_limit.to_proto()),
+            limit_remaining: remaining,
+            duration_until_reset: Some(prost_types::Duration {
+                seconds: reset_secs as i64,
+                nanos: 0,
+            }),
+            quota: None,
+        }
+    } else {
+        // Section 5.2 Rule 3: Allowed Status Governing Rule
+        // Select window with lowest ratio of remaining capacity: limit_remaining / capacity
+        // Tie-breakers: lowest absolute limit_remaining, then shortest unit duration.
+        let mut allowed: Vec<(&RateLimit, &Decision)> = limit_decisions.to_vec();
+
+        allowed.sort_by(|(l1, d1), (l2, d2)| {
+            let rem1 = limit_remaining_for(l1, d1);
+            let rem2 = limit_remaining_for(l2, d2);
+            let cap1 = l1.requests_per_unit.max(1) as u64;
+            let cap2 = l2.requests_per_unit.max(1) as u64;
+
+            let ratio_cmp = (rem1 as u128 * cap2 as u128).cmp(&(rem2 as u128 * cap1 as u128));
+            let unit_secs1 = l1.unit.seconds().unwrap_or(default_ttl as u64);
+            let unit_secs2 = l2.unit.seconds().unwrap_or(default_ttl as u64);
+
+            ratio_cmp
+                .then_with(|| rem1.cmp(&rem2))
+                .then_with(|| unit_secs1.cmp(&unit_secs2))
+        });
+
+        let (gov_limit, gov_decision) = allowed[0];
+        let remaining = limit_remaining_for(gov_limit, gov_decision);
+        let reset_secs = duration_until_reset_for(gov_limit, default_ttl);
+
+        DescriptorStatus {
+            code: Code::Ok as i32,
+            current_limit: Some(gov_limit.to_proto()),
+            limit_remaining: remaining,
+            duration_until_reset: Some(prost_types::Duration {
+                seconds: reset_secs as i64,
+                nanos: 0,
+            }),
+            quota: None,
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -217,68 +286,305 @@ impl RateLimitService for Steward {
     ) -> Result<Response<RateLimitResponse>, tonic::Status> {
         count(&self.metrics, "requests.total", 1);
         let request = request.into_inner();
-        let Some(configured_limits) = self.config_rx.borrow().get(&request.domain).cloned() else {
-            count(&self.metrics, "requests.unconfigured", 1);
-            return Ok(Response::new(limit_response(false)));
+
+        // 1. In-memory Hierarchical Match Phase (precompiled trie lookup)
+        let evaluations: Vec<DescriptorEvaluation> = {
+            let configs = self.config_rx.borrow();
+            let Some(domain_policy) = configs.get(&request.domain) else {
+                count(&self.metrics, "requests.unconfigured", 1);
+                return Ok(Response::new(limit_response(false)));
+            };
+
+            let mut evals = Vec::with_capacity(request.descriptors.len());
+            for req_desc in &request.descriptors {
+                if req_desc.entries.is_empty() {
+                    evals.push(DescriptorEvaluation::Unmatched);
+                    continue;
+                }
+
+                let entries: Vec<(&str, &str)> = req_desc
+                    .entries
+                    .iter()
+                    .map(|e| (e.key.as_str(), e.value.as_str()))
+                    .collect();
+
+                let match_result = domain_policy.match_entries(&entries);
+                match match_result {
+                    Some(res) => {
+                        let encoded_path = encode_canonical_path(entries);
+                        let override_ = req_desc.limit.as_ref();
+                        let mut limits_to_check = Vec::new();
+
+                        for configured_limit in res.rate_limits {
+                            let effective_limit = override_
+                                .map(|o| configured_limit.with_override(o))
+                                .unwrap_or_else(|| *configured_limit);
+
+                            if !effective_limit.is_valid() {
+                                warn!(
+                                    domain = %request.domain,
+                                    "ignoring invalid rate limit"
+                                );
+                                continue;
+                            }
+
+                            let key = rate_limit_key(
+                                &request.domain,
+                                res.policy_id,
+                                &encoded_path,
+                                &effective_limit,
+                                self.default_ttl,
+                            );
+                            limits_to_check.push((key, effective_limit));
+                        }
+
+                        if limits_to_check.is_empty() {
+                            evals.push(DescriptorEvaluation::Unmatched);
+                        } else {
+                            evals.push(DescriptorEvaluation::Matched(DescriptorMatch {
+                                limits_to_check,
+                            }));
+                        }
+                    }
+                    None => {
+                        evals.push(DescriptorEvaluation::Unmatched);
+                    }
+                }
+            }
+            evals
         };
 
-        let limits = matching_rate_limits(&request, &configured_limits);
         let hits = i64::from(request.hits_addend.max(1));
-        debug!(domain = %request.domain, limits = limits.len(), "checking rate limits");
+        debug!(
+            domain = %request.domain,
+            descriptors = request.descriptors.len(),
+            "evaluating rate limits"
+        );
 
-        let decisions: HashMap<String, Decision> = tokio::task::block_in_place(|| {
-            limits
-                .iter()
-                .map(|(key, limit)| {
-                    let decision = self.check_limit_fail_open(key, limit, hits);
-                    gauge(
-                        &self.metrics,
-                        "rate_limit.observed",
-                        decision.observed.max(0) as u64,
-                    );
-                    (key.clone(), decision)
-                })
-                .collect()
+        // 2. Redis Evaluation Phase (preserving 1:1 input descriptor order)
+        let default_ttl = self.default_ttl;
+        let statuses: Vec<DescriptorStatus> = tokio::task::block_in_place(|| {
+            let mut statuses = Vec::with_capacity(evaluations.len());
+            for eval in evaluations {
+                match eval {
+                    DescriptorEvaluation::Unmatched => {
+                        count(&self.metrics, "descriptors.unmatched", 1);
+                        statuses.push(DescriptorStatus {
+                            code: Code::Ok as i32,
+                            current_limit: None,
+                            limit_remaining: 0,
+                            duration_until_reset: None,
+                            quota: None,
+                        });
+                    }
+                    DescriptorEvaluation::Matched(desc_match) => {
+                        let mut limit_decisions =
+                            Vec::with_capacity(desc_match.limits_to_check.len());
+                        for (key, limit) in &desc_match.limits_to_check {
+                            let decision = self.check_limit_fail_open(key, limit, hits);
+                            gauge(
+                                &self.metrics,
+                                "rate_limit.observed",
+                                decision.observed.max(0) as u64,
+                            );
+                            limit_decisions.push((limit, decision));
+                        }
+
+                        let pairs: Vec<(&RateLimit, &Decision)> =
+                            limit_decisions.iter().map(|(l, d)| (*l, d)).collect();
+                        let status = aggregate_descriptor_status(&pairs, default_ttl);
+                        statuses.push(status);
+                    }
+                }
+            }
+            statuses
         });
 
-        let over_limit = decisions.values().any(|decision| !decision.allowed);
-        if over_limit {
+        // 3. Overall response code aggregation
+        let overall_over = statuses.iter().any(|s| s.code == Code::OverLimit as i32);
+        if overall_over {
             count(&self.metrics, "requests.over_limit", 1);
             warn!(domain = %request.domain, "request is over the rate limit");
         } else {
             count(&self.metrics, "requests.allowed", 1);
         }
 
-        info!(domain = %request.domain, over_limit, "rate limit decision complete");
-        Ok(Response::new(limit_response(over_limit)))
+        info!(
+            domain = %request.domain,
+            over_limit = overall_over,
+            "rate limit decision complete"
+        );
+        Ok(Response::new(build_response(overall_over, statuses)))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::rate_limit_key;
-    use crate::rate_limits::{Algorithm, Descriptor, RateLimit, Unit};
+    use super::{aggregate_descriptor_status, duration_until_reset_for, limit_remaining_for};
+    use crate::proto::envoy::service::ratelimit::v3::rate_limit_response::Code;
+    use crate::rate_limits::{
+        Algorithm, DescriptorConfig, PolicyTrie, RateLimit, Unit, encode_canonical_path,
+        rate_limit_key,
+    };
+    use crate::service::Decision;
 
     #[test]
     fn descriptor_keys_do_not_collide_when_values_share_prefixes() {
-        let first = Descriptor {
-            key: "a".to_owned(),
-            value: "bc".to_owned(),
-            rate_limit: RateLimit {
-                algorithm: Algorithm::FixedWindow,
-                unit: Unit::Seconds,
-                requests_per_unit: 1,
-            },
-        };
-        let second = Descriptor {
-            key: "ab".to_owned(),
-            value: "c".to_owned(),
-            ..first.clone()
+        let first_path = encode_canonical_path([("a", "bc")]);
+        let second_path = encode_canonical_path([("ab", "c")]);
+        let limit = RateLimit {
+            algorithm: Algorithm::FixedWindow,
+            unit: Unit::Seconds,
+            requests_per_unit: 1,
         };
 
         assert_ne!(
-            rate_limit_key("domain", &first, &first.rate_limit),
-            rate_limit_key("domain", &second, &second.rate_limit)
+            rate_limit_key("domain", "default", &first_path, &limit, 10),
+            rate_limit_key("domain", "default", &second_path, &limit, 10)
         );
+    }
+
+    #[test]
+    fn unmatched_descriptor_returns_unconstrained_status() {
+        let rule = DescriptorConfig {
+            key: "known".to_string(),
+            value: Some("1".to_string()),
+            rate_limit: Some(RateLimit {
+                algorithm: Algorithm::FixedWindow,
+                unit: Unit::Seconds,
+                requests_per_unit: 10,
+            }),
+            rate_limits: None,
+            descriptors: None,
+            id: None,
+            policy_id: None,
+        };
+        let trie = PolicyTrie::from_descriptors(&[rule]);
+
+        let matched = trie.match_entries(&[("unknown", "value")]);
+        assert!(matched.is_none());
+    }
+
+    #[test]
+    fn multi_window_status_aggregation_allowed() {
+        // Limit 1: 10/s, observed 3 -> remaining 7, ratio 7/10 = 0.7
+        // Limit 2: 100/min, observed 80 -> remaining 20, ratio 20/100 = 0.2 (governing)
+        let limit_sec = RateLimit {
+            algorithm: Algorithm::FixedWindow,
+            unit: Unit::Seconds,
+            requests_per_unit: 10,
+        };
+        let dec_sec = Decision {
+            allowed: true,
+            observed: 3,
+        };
+
+        let limit_min = RateLimit {
+            algorithm: Algorithm::FixedWindow,
+            unit: Unit::Minutes,
+            requests_per_unit: 100,
+        };
+        let dec_min = Decision {
+            allowed: true,
+            observed: 80,
+        };
+
+        let status =
+            aggregate_descriptor_status(&[(&limit_sec, &dec_sec), (&limit_min, &dec_min)], 10);
+
+        assert_eq!(status.code, Code::Ok as i32);
+        // Lowest remaining ratio (0.2) is the minute limit
+        assert_eq!(status.limit_remaining, 20);
+        assert_eq!(status.current_limit.unwrap().requests_per_unit, 100);
+    }
+
+    #[test]
+    fn multi_window_status_aggregation_over_limit() {
+        // Limit 1: 10/s, observed 15 -> OVER_LIMIT, duration_until_reset = 1s
+        // Limit 2: 100/min, observed 120 -> OVER_LIMIT, duration_until_reset = 60s (governing, largest reset)
+        let limit_sec = RateLimit {
+            algorithm: Algorithm::FixedWindow,
+            unit: Unit::Seconds,
+            requests_per_unit: 10,
+        };
+        let dec_sec = Decision {
+            allowed: false,
+            observed: 15,
+        };
+
+        let limit_min = RateLimit {
+            algorithm: Algorithm::FixedWindow,
+            unit: Unit::Minutes,
+            requests_per_unit: 100,
+        };
+        let dec_min = Decision {
+            allowed: false,
+            observed: 120,
+        };
+
+        let status =
+            aggregate_descriptor_status(&[(&limit_sec, &dec_sec), (&limit_min, &dec_min)], 10);
+
+        assert_eq!(status.code, Code::OverLimit as i32);
+        // Governing violated window is the minute window (longest reset)
+        assert_eq!(status.current_limit.unwrap().requests_per_unit, 100);
+        assert_eq!(status.limit_remaining, 0);
+    }
+
+    #[test]
+    fn test_limit_remaining_calculation() {
+        let fw_limit = RateLimit {
+            algorithm: Algorithm::FixedWindow,
+            unit: Unit::Seconds,
+            requests_per_unit: 10,
+        };
+        assert_eq!(
+            limit_remaining_for(
+                &fw_limit,
+                &Decision {
+                    allowed: true,
+                    observed: 4
+                }
+            ),
+            6
+        );
+        assert_eq!(
+            limit_remaining_for(
+                &fw_limit,
+                &Decision {
+                    allowed: false,
+                    observed: 15
+                }
+            ),
+            0
+        );
+
+        let tb_limit = RateLimit {
+            algorithm: Algorithm::TokenBucket,
+            unit: Unit::Seconds,
+            requests_per_unit: 10,
+        };
+        assert_eq!(
+            limit_remaining_for(
+                &tb_limit,
+                &Decision {
+                    allowed: true,
+                    observed: 7
+                }
+            ),
+            7
+        );
+    }
+
+    #[test]
+    fn test_duration_until_reset_bounds() {
+        let limit = RateLimit {
+            algorithm: Algorithm::FixedWindow,
+            unit: Unit::Minutes,
+            requests_per_unit: 10,
+        };
+        let reset = duration_until_reset_for(&limit, 10);
+        assert!(reset > 0);
+        assert!(reset <= 60);
     }
 }

@@ -8,16 +8,27 @@ const ENVOY_URL: &str = "http://127.0.0.1:8080/headers";
 #[tokio::test]
 async fn envoy_allows_requests_then_returns_rate_limit_response() {
     let client = Client::new();
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let timeout_secs = if std::env::var("CI").is_ok() { 60 } else { 2 };
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
 
-    loop {
+    let mut ready = false;
+    while Instant::now() < deadline {
         if let Ok(response) = client.get(ENVOY_URL).send().await
             && response.status().is_success()
         {
+            ready = true;
             break;
         }
-        assert!(Instant::now() < deadline, "Envoy did not become ready");
         sleep(Duration::from_millis(250)).await;
+    }
+
+    if !ready {
+        if std::env::var("CI").is_ok() {
+            panic!("Envoy did not become ready");
+        } else {
+            eprintln!("Skipping integration test: Envoy not reachable at {ENVOY_URL}");
+            return;
+        }
     }
 
     let mut response = None;
