@@ -10,7 +10,7 @@
 
 ## 1. Overview & Architecture Context
 
-Steward relies on Redis as its authoritative external counter store. To protect rate-limiting semantics against silent quota resets, all production Redis instances enforce **`maxmemory-policy noeviction`** as ratified in [`docs/redis-operational-guide.md`](file:///home/vsyrakis/Documents/steward/docs/redis-operational-guide.md).
+Steward relies on Redis as its authoritative external counter store. To protect rate-limiting semantics against silent quota resets, all production Redis instances enforce **`maxmemory-policy noeviction`** as ratified in [`docs/redis-operational-guide.md`](../redis-operational-guide.md).
 
 When Redis reaches `maxmemory`, it rejects write operations with `OOM command not allowed when used memory > 'maxmemory'`. Steward catches this and applies the **F06 Error Precedence Rule**:
 - Definitively denied calls (`OVER_LIMIT`) continue to be enforced.

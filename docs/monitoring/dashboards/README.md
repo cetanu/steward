@@ -4,7 +4,7 @@ This directory contains production monitoring and Service Level Objective (SLO) 
 
 ## Available Dashboards
 
-- [`steward-slo.json`](file:///home/vsyrakis/Documents/steward/docs/monitoring/dashboards/steward-slo.json): Comprehensive Service Level Objective (SLO), Traffic Breakdown, Decision Latency, Admission Control, and Configuration Freshness dashboard.
+- [`steward-slo.json`](steward-slo.json): Comprehensive Service Level Objective (SLO), Traffic Breakdown, Decision Latency, Admission Control, and Configuration Freshness dashboard.
 
 ---
 

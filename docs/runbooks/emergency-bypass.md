@@ -61,7 +61,7 @@ When Steward or its storage backend suffers catastrophic failure, operators have
 ### Tier 2: Envoy Fail-Open Toggling (`failure_mode_deny: false`)
 *Use when Redis is completely down and Steward is returning `Unavailable`.*
 
-1. In Envoy's configuration ([`containers/envoy.yaml`](file:///home/vsyrakis/Documents/steward/containers/envoy.yaml) or your production Helm/ConfigMap):
+1. In Envoy's configuration ([`containers/envoy.yaml`](../../containers/envoy.yaml) or your production Helm/ConfigMap):
    Locate `envoy.filters.http.ratelimit`:
    ```yaml
    http_filters:

@@ -10,7 +10,7 @@
 
 ## 1. Overview & Architecture Context
 
-Steward employs an asynchronous, non-blocking configuration loader ([`src/config_source.rs`](file:///home/vsyrakis/Documents/steward/src/config_source.rs)):
+Steward employs an asynchronous, non-blocking configuration loader ([`src/config_source.rs`](../../src/config_source.rs)):
 - **Whole-Snapshot Validation:** New policy files are validated in full (checking units, positive capacities, duplicate rules, and size bounds $\le 10\text{ MiB}$) before being compiled into an immutable `Arc<CompiledConfig>` trie.
 - **Resilient Reloads:** If a reload fails (network error, syntax error, or semantic validation failure), Steward **retains the active snapshot untouched** without dropping traffic or restarting.
 - **Maximum Stale Duration:** If the active snapshot age exceeds `max_stale_duration` (default: 3600 seconds / 1 hour), Steward raises a critical `config_stale = 1` alert.

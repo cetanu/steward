@@ -2,7 +2,7 @@
 
 **Topology, Sizing, Durability, and Failover Runbooks**
 
-This document establishes the official operational architecture, capacity planning formulas, memory and eviction policies, and disaster recovery runbooks for Redis storage backends backing Steward instances. It resolves Finding **F16** from [`docs/production-readiness.md`](file:///home/vsyrakis/Documents/steward/docs/production-readiness.md) and completes Milestone **M3.5**.
+This document establishes the official operational architecture, capacity planning formulas, memory and eviction policies, and disaster recovery runbooks for Redis storage backends backing Steward instances. It resolves Finding **F16** from [`docs/production-readiness.md`](production-readiness.md) and completes Milestone **M3.5**.
 
 ---
 
@@ -133,7 +133,7 @@ maxmemory-policy noeviction
    Under `maxmemory-policy noeviction`, when `maxmemory` is reached, write commands (`INCRBY`, `HSET`, `ZADD`) fail immediately with:
    `OOM command not allowed when used memory > 'maxmemory'`.
    - Steward catches this Redis error.
-   - Under the ratified **F06 Error Precedence Rule** ([`docs/failure-policy.md`](file:///home/vsyrakis/Documents/steward/docs/failure-policy.md)), Steward logs the failure, increments `redis.errors`, and returns gRPC `Status::unavailable("rate limit storage backend is unavailable")`.
+   - Under the ratified **F06 Error Precedence Rule** ([`docs/failure-policy.md`](failure-policy.md)), Steward logs the failure, increments `redis.errors`, and returns gRPC `Status::unavailable("rate limit storage backend is unavailable")`.
    - Envoy then applies its configured `failure_mode_deny` policy (`true` to fail-closed, or `false` to fail-open).
    - This ensures operators retain complete, deterministic control over failure behavior instead of suffering silent quota resets.
 
