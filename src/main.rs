@@ -1,9 +1,6 @@
-use socket2::{Domain, Socket, Type};
 use std::net::SocketAddr;
 
-use tokio::net::TcpListener;
 use tokio::sync::watch;
-use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 use tracing::info;
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
@@ -74,17 +71,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "connecting to Redis storage backend"
     );
 
-    let steward = Steward::try_new(
-        redis_target.as_str(),
-        settings.default_ttl,
-        config_rx,
-        metrics,
-    )
-    .await?
-    .with_execution_timeout(std::time::Duration::from_millis(
-        settings.execution_timeout_ms,
-    ))
-    .with_max_concurrent_requests(settings.max_concurrent_requests);
+    let steward = Steward::try_new(redis_target.as_str(), config_rx, metrics)
+        .await?
+        .with_execution_timeout(std::time::Duration::from_millis(
+            settings.execution_timeout_ms,
+        ))
+        .with_max_concurrent_requests(settings.max_concurrent_requests);
 
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
     health_reporter
@@ -95,15 +87,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await;
 
     let addr = SocketAddr::new(settings.listen.addr.into(), settings.listen.port);
-    let socket = Socket::new(Domain::for_address(addr), Type::STREAM, None)?;
-    socket.set_reuse_address(true)?;
-    socket.set_reuse_port(true)?;
-    socket.bind(&addr.into())?;
-    socket.set_nonblocking(true)?;
-    socket.listen(128)?;
-    let listener = TcpListener::from_std(std::net::TcpListener::from(socket))?;
-    let incoming = TcpListenerStream::new(listener);
-
     info!(%addr, "starting Steward rate-limit service with gRPC health checking");
     let mut server = Server::builder()
         .concurrency_limit_per_connection(1024)
@@ -147,7 +130,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let serve_future = server
         .add_service(health_service)
         .add_service(RateLimitServiceServer::new(steward))
-        .serve_with_incoming_shutdown(incoming, async {
+        .serve_with_shutdown(addr, async {
             let _ = shutdown_rx.await;
             info!("stopping listener and draining in-flight requests");
         });

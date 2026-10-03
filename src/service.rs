@@ -278,7 +278,6 @@ enum DescriptorEvaluation {
 pub struct Steward {
     config_rx: Receiver<RateLimitConfigs>,
     redis: ConnectionManager,
-    default_ttl: usize,
     metrics: SharedMetrics,
     scripts: StewardScripts,
     pub execution_timeout: Duration,
@@ -335,14 +334,9 @@ pub fn normalize_redis_url(target: &str) -> Result<String, String> {
 
 impl Steward {
     /// Construct a service with metrics disabled.
-    pub async fn new(
-        redis_target: &str,
-        default_ttl: usize,
-        config_rx: Receiver<RateLimitConfigs>,
-    ) -> Self {
+    pub async fn new(redis_target: &str, config_rx: Receiver<RateLimitConfigs>) -> Self {
         Self::try_new(
             redis_target,
-            default_ttl,
             config_rx,
             std::sync::Arc::new(StatsdClient::from_sink("", NopMetricSink)),
         )
@@ -353,7 +347,6 @@ impl Steward {
     /// Construct a service and return configuration or connection manager initialization errors.
     pub async fn try_new(
         redis_target: &str,
-        default_ttl: usize,
         config_rx: Receiver<RateLimitConfigs>,
         metrics: SharedMetrics,
     ) -> Result<Self, String> {
@@ -374,7 +367,6 @@ impl Steward {
         Ok(Self {
             config_rx,
             redis,
-            default_ttl,
             metrics,
             scripts: StewardScripts::default(),
             execution_timeout: DEFAULT_EXECUTION_TIMEOUT,
@@ -456,7 +448,6 @@ impl Steward {
         Self {
             config_rx,
             redis,
-            default_ttl: 10,
             metrics: Arc::new(StatsdClient::from_sink("", NopMetricSink)),
             scripts: StewardScripts::default(),
             execution_timeout: DEFAULT_EXECUTION_TIMEOUT,
@@ -495,11 +486,7 @@ impl Steward {
         op: HitOperation,
     ) -> redis::RedisResult<Decision> {
         let mut connection = self.redis.clone();
-        let window_seconds = limit
-            .unit
-            .seconds()
-            .unwrap_or(self.default_ttl as u64)
-            .max(1);
+        let window_seconds = limit.unit.seconds().unwrap_or(60).max(1);
 
         match op {
             HitOperation::Probe => match limit.algorithm {
@@ -731,8 +718,8 @@ pub fn is_redis_timeout(err: &redis::RedisError) -> bool {
     desc.contains("timeout") || desc.contains("timed out") || desc.contains("deadline")
 }
 
-pub fn duration_until_reset_for(limit: &RateLimit, default_ttl: usize) -> u64 {
-    let window_secs = limit.unit.seconds().unwrap_or(default_ttl as u64).max(1);
+pub fn duration_until_reset_for(limit: &RateLimit) -> u64 {
+    let window_secs = limit.unit.seconds().unwrap_or(60).max(1);
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -757,7 +744,6 @@ pub fn limit_remaining_for(limit: &RateLimit, decision: &Decision) -> u32 {
 
 pub fn aggregate_descriptor_status(
     limit_decisions: &[(&RateLimit, &Decision)],
-    default_ttl: usize,
 ) -> DescriptorStatus {
     if limit_decisions.is_empty() {
         return DescriptorStatus {
@@ -781,10 +767,10 @@ pub fn aggregate_descriptor_status(
             .collect();
 
         violated.sort_by(|(l1, _), (l2, _)| {
-            let reset1 = duration_until_reset_for(l1, default_ttl);
-            let reset2 = duration_until_reset_for(l2, default_ttl);
-            let unit_secs1 = l1.unit.seconds().unwrap_or(default_ttl as u64);
-            let unit_secs2 = l2.unit.seconds().unwrap_or(default_ttl as u64);
+            let reset1 = duration_until_reset_for(l1);
+            let reset2 = duration_until_reset_for(l2);
+            let unit_secs1 = l1.unit.seconds().unwrap_or(60);
+            let unit_secs2 = l2.unit.seconds().unwrap_or(60);
 
             reset2
                 .cmp(&reset1)
@@ -793,7 +779,7 @@ pub fn aggregate_descriptor_status(
 
         let (gov_limit, gov_decision) = violated[0];
         let remaining = limit_remaining_for(gov_limit, gov_decision);
-        let reset_secs = duration_until_reset_for(gov_limit, default_ttl);
+        let reset_secs = duration_until_reset_for(gov_limit);
 
         DescriptorStatus {
             code: Code::OverLimit as i32,
@@ -818,8 +804,8 @@ pub fn aggregate_descriptor_status(
             let cap2 = l2.requests_per_unit.max(1) as u64;
 
             let ratio_cmp = (rem1 as u128 * cap2 as u128).cmp(&(rem2 as u128 * cap1 as u128));
-            let unit_secs1 = l1.unit.seconds().unwrap_or(default_ttl as u64);
-            let unit_secs2 = l2.unit.seconds().unwrap_or(default_ttl as u64);
+            let unit_secs1 = l1.unit.seconds().unwrap_or(60);
+            let unit_secs2 = l2.unit.seconds().unwrap_or(60);
 
             ratio_cmp
                 .then_with(|| rem1.cmp(&rem2))
@@ -828,7 +814,7 @@ pub fn aggregate_descriptor_status(
 
         let (gov_limit, gov_decision) = allowed[0];
         let remaining = limit_remaining_for(gov_limit, gov_decision);
-        let reset_secs = duration_until_reset_for(gov_limit, default_ttl);
+        let reset_secs = duration_until_reset_for(gov_limit);
 
         DescriptorStatus {
             code: Code::Ok as i32,
@@ -1093,7 +1079,6 @@ impl RateLimitService for Steward {
                                 res.policy_id,
                                 &encoded_path,
                                 configured_limit,
-                                self.default_ttl,
                             );
                             limits_to_check.push((key, effective_limit));
                         }
@@ -1131,7 +1116,6 @@ impl RateLimitService for Steward {
 
         // 4. Redis Evaluation Phase (wrapped in bounded timeout, preserving 1:1 input descriptor order)
         let redis_start = std::time::Instant::now();
-        let default_ttl = self.default_ttl;
         let eval_result = tokio::time::timeout(effective_timeout, async {
             let eval_futures = evaluations.into_iter().map(|eval| async move {
                 match eval {
@@ -1187,17 +1171,17 @@ impl RateLimitService for Steward {
                                 .filter(|(_, dec)| !dec.allowed)
                                 .map(|(l, d)| (*l, d))
                                 .collect();
-                            aggregate_descriptor_status(&violated, default_ttl)
+                            aggregate_descriptor_status(&violated)
                         } else if failed_rules.is_empty() {
                             let pairs: Vec<(&RateLimit, &Decision)> =
                                 successful_decisions.iter().map(|(l, d)| (*l, d)).collect();
-                            aggregate_descriptor_status(&pairs, default_ttl)
+                            aggregate_descriptor_status(&pairs)
                         } else {
                             let gov_limit = successful_decisions
                                 .first()
                                 .map(|(l, _)| **l)
                                 .unwrap_or(desc_match.limits_to_check[0].1);
-                            let reset_secs = duration_until_reset_for(&gov_limit, default_ttl);
+                            let reset_secs = duration_until_reset_for(&gov_limit);
                             DescriptorStatus {
                                 code: Code::Unknown as i32,
                                 current_limit: Some(gov_limit.to_proto()),
@@ -1309,8 +1293,8 @@ mod tests {
         };
 
         assert_ne!(
-            rate_limit_key("domain", "default", &first_path, &limit, 10),
-            rate_limit_key("domain", "default", &second_path, &limit, 10)
+            rate_limit_key("domain", "default", &first_path, &limit),
+            rate_limit_key("domain", "default", &second_path, &limit)
         );
     }
 
@@ -1359,8 +1343,7 @@ mod tests {
             observed: 80,
         };
 
-        let status =
-            aggregate_descriptor_status(&[(&limit_sec, &dec_sec), (&limit_min, &dec_min)], 10);
+        let status = aggregate_descriptor_status(&[(&limit_sec, &dec_sec), (&limit_min, &dec_min)]);
 
         assert_eq!(status.code, Code::Ok as i32);
         // Lowest remaining ratio (0.2) is the minute limit
@@ -1392,8 +1375,7 @@ mod tests {
             observed: 120,
         };
 
-        let status =
-            aggregate_descriptor_status(&[(&limit_sec, &dec_sec), (&limit_min, &dec_min)], 10);
+        let status = aggregate_descriptor_status(&[(&limit_sec, &dec_sec), (&limit_min, &dec_min)]);
 
         assert_eq!(status.code, Code::OverLimit as i32);
         // Governing violated window is the minute window (longest reset)
@@ -1453,7 +1435,7 @@ mod tests {
             unit: Unit::Minutes,
             requests_per_unit: 10,
         };
-        let reset = duration_until_reset_for(&limit, 10);
+        let reset = duration_until_reset_for(&limit);
         assert!(reset > 0);
         assert!(reset <= 60);
     }
@@ -1910,7 +1892,6 @@ mod tests {
         let steward = super::Steward {
             config_rx: rx,
             redis,
-            default_ttl: 10,
             metrics: std::sync::Arc::new(cadence::StatsdClient::from_sink(
                 "",
                 cadence::NopMetricSink,
@@ -1953,7 +1934,6 @@ mod tests {
         let steward = super::Steward {
             config_rx: rx,
             redis,
-            default_ttl: 10,
             metrics: std::sync::Arc::new(cadence::StatsdClient::from_sink(
                 "",
                 cadence::NopMetricSink,
@@ -2039,7 +2019,6 @@ mod tests {
         let steward = super::Steward {
             config_rx: rx,
             redis,
-            default_ttl: 10,
             metrics: std::sync::Arc::new(cadence::StatsdClient::from_sink(
                 "",
                 cadence::NopMetricSink,
@@ -2122,7 +2101,6 @@ mod tests {
         let steward = super::Steward {
             config_rx: rx,
             redis,
-            default_ttl: 10,
             metrics: std::sync::Arc::new(cadence::StatsdClient::from_sink(
                 "",
                 cadence::NopMetricSink,
@@ -2282,7 +2260,6 @@ mod tests {
         let steward = super::Steward {
             config_rx: rx,
             redis,
-            default_ttl: 10,
             metrics: std::sync::Arc::new(cadence::StatsdClient::from_sink(
                 "",
                 cadence::NopMetricSink,
@@ -2357,7 +2334,6 @@ mod tests {
         let steward = super::Steward {
             config_rx: rx,
             redis,
-            default_ttl: 10,
             metrics: std::sync::Arc::new(cadence::StatsdClient::from_sink(
                 "",
                 cadence::NopMetricSink,
@@ -2382,7 +2358,6 @@ mod tests {
             premium_match.policy_id,
             &premium_path,
             &premium_limit,
-            10,
         );
         let _: () = redis::cmd("SET")
             .arg(&premium_key)
@@ -2401,7 +2376,6 @@ mod tests {
             standard_match.policy_id,
             &standard_path,
             &standard_limit,
-            10,
         );
         let _: () = redis::cmd("HSET")
             .arg(&standard_key)
@@ -2488,7 +2462,6 @@ mod tests {
         let steward = super::Steward {
             config_rx: rx,
             redis,
-            default_ttl: 10,
             metrics: std::sync::Arc::new(cadence::StatsdClient::from_sink(
                 "",
                 cadence::NopMetricSink,
@@ -2759,13 +2732,7 @@ mod tests {
         let domain_policy = steward.config_rx.borrow().get(domain).unwrap().clone();
         let matched = domain_policy.match_entries(&[("tier", "gold")]).unwrap();
         let path = encode_canonical_path([("tier", "gold")]);
-        let rkey = rate_limit_key(
-            domain,
-            matched.policy_id,
-            &path,
-            &matched.rate_limits[0],
-            10,
-        );
+        let rkey = rate_limit_key(domain, matched.policy_id, &path, &matched.rate_limits[0]);
         let count: i64 = redis::cmd("GET").arg(&rkey).query(&mut conn).unwrap();
         assert_eq!(count, 7, "Redis counter must record exact hit count of 7");
     }
@@ -3196,13 +3163,7 @@ mod tests {
                 .match_entries(&[("client_id", client_id)])
                 .unwrap();
             let path = encode_canonical_path([("client_id", client_id)]);
-            let rkey = rate_limit_key(
-                domain,
-                matched.policy_id,
-                &path,
-                &matched.rate_limits[0],
-                10,
-            );
+            let rkey = rate_limit_key(domain, matched.policy_id, &path, &matched.rate_limits[0]);
             let actual: i64 = redis::cmd("GET").arg(&rkey).query(&mut conn).unwrap();
             assert_eq!(
                 actual, expected_count,
@@ -3386,13 +3347,7 @@ mod tests {
         let domain_policy = steward.config_rx.borrow().get(domain).unwrap().clone();
         let matched = domain_policy.match_entries(&[("api", "compute")]).unwrap();
         let path = encode_canonical_path([("api", "compute")]);
-        let rkey = rate_limit_key(
-            domain,
-            matched.policy_id,
-            &path,
-            &matched.rate_limits[0],
-            10,
-        );
+        let rkey = rate_limit_key(domain, matched.policy_id, &path, &matched.rate_limits[0]);
         let count: i64 = redis::cmd("GET").arg(&rkey).query(&mut conn).unwrap();
         assert_eq!(
             count, 12,
@@ -3525,13 +3480,7 @@ mod tests {
         let domain_policy = steward.config_rx.borrow().get(domain).unwrap().clone();
         let matched = domain_policy.match_entries(&[("service", "auth")]).unwrap();
         let path = encode_canonical_path([("service", "auth")]);
-        let rkey = rate_limit_key(
-            domain,
-            matched.policy_id,
-            &path,
-            &matched.rate_limits[0],
-            10,
-        );
+        let rkey = rate_limit_key(domain, matched.policy_id, &path, &matched.rate_limits[0]);
         let count: i64 = redis::cmd("GET").arg(&rkey).query(&mut conn).unwrap();
         assert_eq!(count, 12);
     }
@@ -3580,7 +3529,6 @@ mod tests {
         let steward = super::Steward {
             config_rx: rx,
             redis,
-            default_ttl: 10,
             metrics: std::sync::Arc::new(cadence::StatsdClient::from_sink(
                 "",
                 cadence::NopMetricSink,
@@ -3678,7 +3626,6 @@ mod tests {
         let steward = super::Steward {
             config_rx: rx,
             redis,
-            default_ttl: 10,
             metrics: std::sync::Arc::new(cadence::StatsdClient::from_sink(
                 "",
                 cadence::NopMetricSink,
@@ -3805,7 +3752,6 @@ mod tests {
             super::Steward {
                 config_rx: rx.clone(),
                 redis,
-                default_ttl: 10,
                 metrics: std::sync::Arc::new(cadence::StatsdClient::from_sink(
                     "",
                     cadence::NopMetricSink,
@@ -4011,7 +3957,6 @@ mod tests {
                 redis::aio::ConnectionManagerConfig::default(),
             )
             .unwrap(),
-            default_ttl: 10,
             metrics: std::sync::Arc::new(cadence::StatsdClient::from_sink(
                 "",
                 cadence::NopMetricSink,
@@ -4200,7 +4145,6 @@ mod tests {
         let steward = super::Steward {
             config_rx: rx,
             redis,
-            default_ttl: 10,
             metrics: std::sync::Arc::new(cadence::StatsdClient::from_sink(
                 "",
                 cadence::NopMetricSink,
@@ -4316,7 +4260,7 @@ mod tests {
             .unwrap();
         let limit = matched.rate_limits[0];
         let path = encode_canonical_path([("endpoint", "checkout")]);
-        let key = rate_limit_key(domain, matched.policy_id, &path, &limit, 10);
+        let key = rate_limit_key(domain, matched.policy_id, &path, &limit);
 
         // Simulate 10 concurrent requests from distinct replicas with hits_addend = 2 (total 20 hits)
         let num_requests = 10;
@@ -4414,7 +4358,7 @@ mod tests {
         let matched = domain_policy.match_entries(&[("api", "search")]).unwrap();
         let limit = matched.rate_limits[0];
         let path = encode_canonical_path([("api", "search")]);
-        let key = rate_limit_key(domain, matched.policy_id, &path, &limit, 10);
+        let key = rate_limit_key(domain, matched.policy_id, &path, &limit);
 
         // Fetch current Redis time
         let redis_time: (i64, i64) = redis::cmd("TIME").query(&mut conn).unwrap();
@@ -4547,7 +4491,7 @@ mod tests {
             .unwrap();
         let limit = matched.rate_limits[0];
         let path = encode_canonical_path([("action", "transfer")]);
-        let key = rate_limit_key(domain, matched.policy_id, &path, &limit, 10);
+        let key = rate_limit_key(domain, matched.policy_id, &path, &limit);
 
         // 1. Initial consumption: consume 8 tokens out of 10 capacity -> 2 tokens remaining
         let d1 = steward
@@ -4660,7 +4604,7 @@ mod tests {
             .unwrap();
         let limit = matched.rate_limits[0];
         let path = encode_canonical_path([("endpoint", "batch")]);
-        let key = rate_limit_key(domain, matched.policy_id, &path, &limit, 10);
+        let key = rate_limit_key(domain, matched.policy_id, &path, &limit);
 
         // 1. gRPC request with hits_addend = 101 must be rejected before Redis execution
         let req1 = RateLimitRequest {
@@ -4880,7 +4824,7 @@ mod tests {
         let matched = domain_policy.match_entries(&[("action", "burn")]).unwrap();
         let limit = matched.rate_limits[0];
         let path = encode_canonical_path([("action", "burn")]);
-        let key = rate_limit_key(domain, matched.policy_id, &path, &limit, 10);
+        let key = rate_limit_key(domain, matched.policy_id, &path, &limit);
 
         let mut ref_model = TokenBucketReference::new(10.0, 10_000);
 
@@ -4970,7 +4914,7 @@ mod tests {
             .unwrap();
         let limit = matched.rate_limits[0];
         let path = encode_canonical_path([("action", "refill")]);
-        let key = rate_limit_key(domain, matched.policy_id, &path, &limit, 10);
+        let key = rate_limit_key(domain, matched.policy_id, &path, &limit);
 
         let mut ref_model = TokenBucketReference::new(10.0, 1_000);
 
@@ -5082,7 +5026,7 @@ mod tests {
             .unwrap();
         let initial_limit = matched.rate_limits[0];
         let path = encode_canonical_path([("tier", "standard")]);
-        let initial_key = rate_limit_key(domain, matched.policy_id, &path, &initial_limit, 10);
+        let initial_key = rate_limit_key(domain, matched.policy_id, &path, &initial_limit);
 
         let mut ref_model = TokenBucketReference::new(5.0, 1_000);
 
@@ -5107,7 +5051,7 @@ mod tests {
             unit: initial_limit.unit,
             algorithm: initial_limit.algorithm,
         };
-        let updated_key = rate_limit_key(domain, matched.policy_id, &path, &updated_limit, 10);
+        let updated_key = rate_limit_key(domain, matched.policy_id, &path, &updated_limit);
 
         // Counter identity is preserved across threshold changes!
         assert_eq!(
@@ -5192,7 +5136,7 @@ mod tests {
             .unwrap();
         let limit = matched.rate_limits[0];
         let path = encode_canonical_path([("action", "clock_test")]);
-        let key = rate_limit_key(domain, matched.policy_id, &path, &limit, 10);
+        let key = rate_limit_key(domain, matched.policy_id, &path, &limit);
 
         let mut ref_model = TokenBucketReference::new(10.0, 10_000);
 
@@ -5300,7 +5244,7 @@ mod tests {
             .unwrap();
         let limit = matched.rate_limits[0];
         let path = encode_canonical_path([("action", "refund_test")]);
-        let key = rate_limit_key(domain, matched.policy_id, &path, &limit, 10);
+        let key = rate_limit_key(domain, matched.policy_id, &path, &limit);
 
         let mut ref_model = TokenBucketReference::new(10.0, 10_000);
 
@@ -5414,7 +5358,7 @@ mod tests {
             .unwrap();
         let limit = matched.rate_limits[0];
         let path = encode_canonical_path([("action", "boundary_test")]);
-        let key = rate_limit_key(domain, matched.policy_id, &path, &limit, 10);
+        let key = rate_limit_key(domain, matched.policy_id, &path, &limit);
 
         let window_ms = 60_000;
         let mut ref_model = SlidingWindowReference::new(window_ms, 5);
@@ -5539,7 +5483,7 @@ mod tests {
             .unwrap();
         let limit = matched.rate_limits[0];
         let path = encode_canonical_path([("endpoint", "concurrency_test")]);
-        let key = rate_limit_key(domain, matched.policy_id, &path, &limit, 10);
+        let key = rate_limit_key(domain, matched.policy_id, &path, &limit);
 
         // Two simulated replicas: replica_a and replica_b
         let replica_a = steward.clone();
@@ -5657,7 +5601,7 @@ mod tests {
             .unwrap();
         let limit = matched.rate_limits[0];
         let path = encode_canonical_path([("action", "format_test")]);
-        let key = rate_limit_key(domain, matched.policy_id, &path, &limit, 10);
+        let key = rate_limit_key(domain, matched.policy_id, &path, &limit);
 
         let mut ref_model = SlidingWindowReference::new(60_000, 50);
 
@@ -5762,7 +5706,7 @@ mod tests {
             .unwrap();
         let limit = matched.rate_limits[0];
         let path = encode_canonical_path([("action", "cap_test")]);
-        let key = rate_limit_key(domain, matched.policy_id, &path, &limit, 10);
+        let key = rate_limit_key(domain, matched.policy_id, &path, &limit);
 
         let mut ref_model = SlidingWindowReference::new(60_000, 25_000);
 
@@ -5862,7 +5806,7 @@ mod tests {
             .unwrap();
         let limit = matched.rate_limits[0];
         let path = encode_canonical_path([("action", "state_test")]);
-        let key = rate_limit_key(domain, matched.policy_id, &path, &limit, 10);
+        let key = rate_limit_key(domain, matched.policy_id, &path, &limit);
 
         // 1. Probe check: does not create key in Redis
         let probe = steward

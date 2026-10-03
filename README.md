@@ -4,15 +4,35 @@ steward
 Mission Statement
 ------------------------------------------------------------
 
-Steward is an implementation of the Lyft Rate-Limit service.
+Steward is a high-performance, production-ready implementation of the Envoy Rate Limit Service (RLS v3) API in Rust, backed by Redis.
 
 
 Features
 ------------------------------------------------------------
 
-* Load rate limit configs from HTTP or a local file
-* Redis-backed fixed-window, token-bucket, and sliding-window rate limiting
-* Optional StatsD metrics over UDP
+* Native Envoy Rate Limit Service (RLS v3) gRPC compatibility with optional TLS/mTLS support
+* High-throughput, non-blocking asynchronous pipeline built on Tokio and Tonic
+* Redis-backed atomic rate limiting with three certified algorithms: Fixed Window, Token Bucket, and Sliding Window
+* Dynamic configuration loading and background hot-reloads from local files or HTTP endpoints
+* Strict admission control, load shedding, and request deadline enforcement
+* Resilient Redis connection management with automatic failover recovery and `NOSCRIPT` script cache healing
+* Comprehensive StatsD metrics and standard gRPC health checking (`grpc.health.v1`)
+
+
+Production Architecture & Qualification
+------------------------------------------------------------
+
+Steward's production operational requirements, accounting semantics, qualification evidence, and runbooks are documented in:
+
+* [Supported Algorithms](docs/algorithms.md) — Mathematical models and Redis state machines for Fixed Window, Token Bucket, and Sliding Window.
+* [Production Readiness Assessment](docs/production-readiness.md) — Milestone roadmap, core findings, and qualification matrix.
+* [Redis Operational Guide](docs/redis-operational-guide.md) — Topology, sizing, failover, persistence, and memory policies.
+* [Operational Runbooks](docs/runbooks/README.md) — Production incident triage, failover, and operational procedures.
+* [Release Dossier v1.0](docs/release-qualification/release-dossier-v1.0.md) — Full GA qualification results, load profiles, chaos verification, and canary sign-off.
+* [Load, Soak & Burst Qualification](docs/release-qualification/load-and-soak-results.md) — Soak stability, high-cardinality churn, and 3× burst verification.
+* [Chaos & Resilience Results](docs/release-qualification/chaos-and-resilience-results.md) — Fault injection, partition, and failover verification.
+* [Canary Verification Report](docs/release-qualification/canary-verification.md) — Stepwise canary rollout and divergence verification.
+
 
 
 Building and testing
@@ -127,7 +147,7 @@ There can be any number of domains and descriptors.
 
 ### Rate-limit algorithms
 
-Each descriptor defaults to the backwards-compatible fixed window algorithm.
+Each descriptor defaults to the `fixed_window` algorithm.
 Set `algorithm` to `fixed_window`, `token_bucket`, or `sliding_window` for a
 different policy:
 
