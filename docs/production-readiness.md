@@ -331,21 +331,21 @@ Milestones are dependency ordered. Each should leave a deployable development pr
 
 ### M0 tasks — Define the production contract
 
-- [ ] **M0.1:** Record supported Envoy version(s), Redis version/topology, initial region/AZ placement, request volume, active identities, policy count, descriptor depth, and maximum hit cost.
-- [ ] **M0.2:** Specify ordered matching, exact/wildcard precedence, unmatched behavior, multiple limits, duplicate charging, override identity, refunds, window boundaries, and partial consumption. Map to F01, F02, F10, and F11.
-- [ ] **M0.3:** Select failure-open or failure-closed behavior for the deployment and declare allowed bypass/state-loss exposure. Adopt the F06 failure precedence and define stale-config readiness.
-- [ ] **M0.4:** Ratify or revise the proposed SLOs, input/resource limits, and benchmark environment. Decide whether exact sliding logs and separate token burst capacity are actual requirements.
+- [x] **M0.1:** Record supported Envoy version(s), Redis version/topology, initial region/AZ placement, request volume, active identities, policy count, descriptor depth, and maximum hit cost.
+- [x] **M0.2:** Specify ordered matching, exact/wildcard precedence, unmatched behavior, multiple limits, duplicate charging, override identity, refunds, window boundaries, and partial consumption. Map to F01, F02, F10, and F11.
+- [x] **M0.3:** Select failure-open or failure-closed behavior for the deployment and declare allowed bypass/state-loss exposure. Adopt the F06 failure precedence and define stale-config readiness.
+- [x] **M0.4:** Ratify or revise the proposed SLOs, input/resource limits, and benchmark environment. Decide whether exact sliding logs and separate token burst capacity are actual requirements.
 
 **Deliverable:** A short behavior contract and a qualification matrix with explicit expected outcomes. Proposed defaults in this report are replaced by the chosen values before release.
 
 ### M1 tasks — Deliver correct fixed-window enforcement
 
-- [ ] **M1.1:** Replace mutable remote schema downloads with a pinned, reviewed local protobuf closure; record provenance and pin codegen inputs. This gives subsequent protocol work a deterministic foundation.
-- [ ] **M1.2:** Replace the flat configuration/matcher with complete ordered rules, exact/wildcard behavior, and multiple limits per descriptor. Update HTTP/file fixtures and Envoy examples together.
-- [ ] **M1.3:** Validate settings and entire policy snapshots; compile before activation; complete initial load before readiness; expose version and last-success state.
-- [ ] **M1.4:** Validate request dimensions, compute descriptor-specific costs, reject malformed overrides and unsupported refunds explicitly, and define stable policy/counter identity.
-- [ ] **M1.5:** Return ordered statuses with fixed-window remaining/reset data; expose Redis failure through gRPC; verify overall error/denial precedence.
-- [ ] **M1.6:** Add deterministic fixed-window, hierarchy, wildcard, override, weighted-hit, duplicate, startup, and reload tests. Verify real Envoy 200/429 behavior and enabled rate-limit headers with isolated Redis state and timed clients.
+- [x] **M1.1:** Replace mutable remote schema downloads with a pinned, reviewed local protobuf closure; record provenance and pin codegen inputs. This gives subsequent protocol work a deterministic foundation.
+- [x] **M1.2:** Replace the flat configuration/matcher with complete ordered rules, exact/wildcard behavior, and multiple limits per descriptor. Update HTTP/file fixtures and Envoy examples together.
+- [x] **M1.3:** Validate settings and entire policy snapshots; compile before activation; complete initial load before readiness; expose version and last-success state.
+- [x] **M1.4:** Validate request dimensions, compute descriptor-specific costs, reject malformed overrides and unsupported refunds explicitly, and define stable policy/counter identity.
+- [x] **M1.5:** Return ordered statuses with fixed-window remaining/reset data; expose Redis failure through gRPC; verify overall error/denial precedence.
+- [x] **M1.6:** Add deterministic fixed-window, hierarchy, wildcard, override, weighted-hit, duplicate, startup, and reload tests. Verify real Envoy 200/429 behavior and enabled rate-limit headers with isolated Redis state and timed clients.
 
 **Exit evidence:** A functioning Envoy → Steward → Redis flow with exact expected decisions for the supported fixed-window contract. Token and sliding algorithms remain explicitly unqualified for production until M2; the development service continues to function throughout.
 
@@ -375,7 +375,7 @@ Milestones are dependency ordered. Each should leave a deployable development pr
 
 ### M4 tasks — Qualify and release
 
-- [ ] **M4.1:** Run the complete correctness/protocol matrix against the selected Envoy and Redis versions and the release image.
+- [x] **M4.1:** Run the complete correctness/protocol matrix against the selected Envoy and Redis versions and the release image. Results published in [docs/release-qualification/correctness-matrix-results.md](release-qualification/correctness-matrix-results.md).
 - [ ] **M4.2:** Run offered-load sweeps, hot-key/high-cardinality tests, maximum supported sliding work, a six-hour soak, and an agreed burst scenario. Publish raw data and compare it to M0 targets.
 - [ ] **M4.3:** Run backend delay/blackhole, network disconnect, primary failover, `NOSCRIPT`, configuration outage/rejection, telemetry failure, and rolling-drain scenarios under load. Quantify bypasses and state loss.
 - [ ] **M4.4:** Run a canary with predefined stop conditions for latency, enforcement error/bypass rate, policy divergence, and Redis saturation. Observe at least a full quota window for relevant policies or obtain equivalent targeted evidence for long windows.
