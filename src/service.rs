@@ -1,8 +1,5 @@
 use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -59,7 +56,34 @@ const TOKEN_BUCKET_SCRIPT: &str = include_str!("scripts/token_bucket.lua");
 const TOKEN_BUCKET_REFUND_SCRIPT: &str = include_str!("scripts/token_bucket_refund.lua");
 const SLIDING_WINDOW_SCRIPT: &str = include_str!("scripts/sliding_window.lua");
 
-static REQUEST_NONCE: AtomicU64 = AtomicU64::new(0);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScriptOutcome {
+    pub allowed: bool,
+    pub observed: i64,
+}
+
+impl redis::FromRedisValue for ScriptOutcome {
+    fn from_redis_value(v: redis::Value) -> Result<Self, redis::ParsingError> {
+        let (allowed_code, observed): (i64, i64) = redis::FromRedisValue::from_redis_value(v)?;
+        Ok(Self {
+            allowed: allowed_code == 1,
+            observed,
+        })
+    }
+}
+
+pub fn generate_sliding_window_nonce() -> String {
+    use ring::rand::SecureRandom;
+    let rng = ring::rand::SystemRandom::new();
+    let mut bytes = [0u8; 16];
+    rng.fill(&mut bytes)
+        .expect("system randomness failed to generate nonce");
+    let mut hex = String::with_capacity(32);
+    for b in bytes {
+        let _ = std::fmt::write(&mut hex, format_args!("{:02x}", b));
+    }
+    hex
+}
 
 #[derive(Clone)]
 pub struct StewardScripts {
@@ -93,6 +117,15 @@ pub enum HitOperation {
 pub struct Decision {
     pub allowed: bool,
     pub observed: i64,
+}
+
+impl From<ScriptOutcome> for Decision {
+    fn from(outcome: ScriptOutcome) -> Self {
+        Self {
+            allowed: outcome.allowed,
+            observed: outcome.observed,
+        }
+    }
 }
 
 struct DescriptorMatch {
@@ -264,7 +297,14 @@ impl Steward {
                     let tokens = match state.0 {
                         None => capacity,
                         Some(t) => {
-                            let elapsed = (now_millis() - state.1.unwrap_or(0)).max(0);
+                            let redis_time: (i64, i64) =
+                                redis::cmd("TIME").query_async(&mut connection).await?;
+                            let mut now_ms = (redis_time.0 * 1000) + (redis_time.1 / 1000);
+                            let last = state.1.unwrap_or(now_ms);
+                            if now_ms < last {
+                                now_ms = last;
+                            }
+                            let elapsed = (now_ms - last).max(0);
                             (t + elapsed as f64 * refill_per_ms).min(capacity)
                         }
                     };
@@ -276,9 +316,12 @@ impl Steward {
                 }
                 Algorithm::SlidingWindow => {
                     let window_ms = window_seconds.saturating_mul(1_000).max(1) as i64;
+                    let redis_time: (i64, i64) =
+                        redis::cmd("TIME").query_async(&mut connection).await?;
+                    let now_ms = (redis_time.0 * 1000) + (redis_time.1 / 1000);
                     let count: i64 = redis::cmd("ZCOUNT")
                         .arg(key)
-                        .arg(now_millis() - window_ms)
+                        .arg(now_ms - window_ms)
                         .arg("+inf")
                         .query_async(&mut connection)
                         .await?;
@@ -306,21 +349,17 @@ impl Steward {
                     let window_ms = window_seconds.saturating_mul(1_000).max(1);
                     let capacity = limit.requests_per_unit as f64;
                     let refill_per_ms = capacity / window_ms as f64;
-                    let result: Vec<i64> = self
+                    let outcome: ScriptOutcome = self
                         .scripts
                         .token_bucket_refund
                         .key(key)
-                        .arg(now_millis())
                         .arg(capacity)
                         .arg(refill_per_ms)
                         .arg(hits as i64)
                         .arg(window_ms)
                         .invoke_async(&mut connection)
                         .await?;
-                    Ok(Decision {
-                        allowed: result.first().copied().unwrap_or(1) == 1,
-                        observed: result.get(1).copied().unwrap_or_default(),
-                    })
+                    Ok(outcome.into())
                 }
                 Algorithm::SlidingWindow => Err(redis::RedisError::from((
                     redis::ErrorKind::Client,
@@ -348,41 +387,38 @@ impl Steward {
                         let window_ms = window_seconds.saturating_mul(1_000).max(1);
                         let capacity = limit.requests_per_unit as f64;
                         let refill_per_ms = capacity / window_ms as f64;
-                        let result: Vec<i64> = self
+                        let outcome: ScriptOutcome = self
                             .scripts
                             .token_bucket
                             .key(key)
-                            .arg(now_millis())
                             .arg(capacity)
                             .arg(refill_per_ms)
                             .arg(hits)
                             .arg(window_ms)
                             .invoke_async(&mut connection)
                             .await?;
-                        Ok(Decision {
-                            allowed: result.first().copied().unwrap_or_default() == 1,
-                            observed: result.get(1).copied().unwrap_or_default(),
-                        })
+                        Ok(outcome.into())
                     }
                     Algorithm::SlidingWindow => {
+                        if hits > 100 {
+                            return Err(redis::RedisError::from((
+                                redis::ErrorKind::Client,
+                                "hit cost exceeds maximum of 100 for sliding window",
+                            )));
+                        }
                         let window_ms = window_seconds.saturating_mul(1_000).max(1);
-                        let nonce = REQUEST_NONCE.fetch_add(1, Ordering::Relaxed);
-                        let nonce = format!("{}-{nonce}", now_millis());
-                        let result: Vec<i64> = self
+                        let nonce = generate_sliding_window_nonce();
+                        let outcome: ScriptOutcome = self
                             .scripts
                             .sliding_window
                             .key(key)
-                            .arg(now_millis())
                             .arg(window_ms)
                             .arg(limit.requests_per_unit)
                             .arg(hits)
                             .arg(nonce)
                             .invoke_async(&mut connection)
                             .await?;
-                        Ok(Decision {
-                            allowed: result.first().copied().unwrap_or_default() == 1,
-                            observed: result.get(1).copied().unwrap_or_default(),
-                        })
+                        Ok(outcome.into())
                     }
                 }
             }
@@ -434,13 +470,6 @@ pub fn is_redis_timeout(err: &redis::RedisError) -> bool {
         }
     }
     desc.contains("timeout") || desc.contains("timed out") || desc.contains("deadline")
-}
-
-fn now_millis() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
 }
 
 pub fn duration_until_reset_for(limit: &RateLimit, default_ttl: usize) -> u64 {
@@ -3592,5 +3621,491 @@ mod tests {
             .unwrap_or(());
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sliding_window_concurrent_replicas_same_millisecond_do_not_overwrite_events() {
+        use crate::proto::envoy::extensions::common::ratelimit::v3::{
+            RateLimitDescriptor, rate_limit_descriptor::Entry,
+        };
+        use crate::proto::envoy::service::ratelimit::v3::RateLimitRequest;
+        use crate::proto::envoy::service::ratelimit::v3::rate_limit_service_server::RateLimitService;
+
+        let domain = "sliding_window_concurrency";
+        let config_json = format!(
+            r#"{{
+            "domain": "{domain}",
+            "descriptors": [
+                {{
+                    "key": "endpoint",
+                    "value": "checkout",
+                    "rate_limit": {{ "algorithm": "sliding_window", "unit": "seconds", "requests_per_unit": 50 }}
+                }}
+            ]
+        }}"#
+        );
+
+        let Some((_server, steward, client)) = setup_test_steward(&config_json).await else {
+            eprintln!("Skipping test: redis-server not available");
+            return;
+        };
+
+        let mut conn = client.get_connection().unwrap();
+        let active_cfg = steward.active_config();
+        let domain_policy = active_cfg.domains.get(domain).unwrap();
+        let matched = domain_policy
+            .match_entries(&[("endpoint", "checkout")])
+            .unwrap();
+        let limit = matched.rate_limits[0];
+        let path = encode_canonical_path([("endpoint", "checkout")]);
+        let key = rate_limit_key(domain, matched.policy_id, &path, &limit, 10);
+
+        // Simulate 10 concurrent requests from distinct replicas with hits_addend = 2 (total 20 hits)
+        let num_requests = 10;
+        let hits_per_req = 2;
+        let mut handles = Vec::new();
+
+        for _ in 0..num_requests {
+            let steward_clone = steward.clone();
+            let req = RateLimitRequest {
+                domain: domain.to_string(),
+                descriptors: vec![RateLimitDescriptor {
+                    entries: vec![Entry {
+                        key: "endpoint".to_string(),
+                        value: "checkout".to_string(),
+                    }],
+                    limit: None,
+                    hits_addend: Some(hits_per_req),
+                    is_negative_hits: false,
+                }],
+                hits_addend: 0,
+            };
+            handles.push(tokio::spawn(async move {
+                steward_clone
+                    .should_rate_limit(tonic::Request::new(req))
+                    .await
+            }));
+        }
+
+        for handle in handles {
+            let res = handle.await.unwrap().unwrap().into_inner();
+            assert_eq!(res.overall_code, Code::Ok as i32);
+        }
+
+        // Verify Redis sorted set cardinality is exactly num_requests * hits_per_req = 20
+        let card: i64 = redis::cmd("ZCARD").arg(&key).query(&mut conn).unwrap();
+        assert_eq!(card, (num_requests * hits_per_req) as i64);
+
+        // Verify member format: now_usec:nonce:i where nonce is 32 hex chars
+        let members: Vec<String> = redis::cmd("ZRANGE")
+            .arg(&key)
+            .arg(0)
+            .arg(-1)
+            .query(&mut conn)
+            .unwrap();
+        assert_eq!(members.len(), 20);
+
+        let mut seen = std::collections::HashSet::new();
+        for m in &members {
+            assert!(seen.insert(m.clone()), "member {m} must be unique");
+            let parts: Vec<&str> = m.split(':').collect();
+            assert_eq!(
+                parts.len(),
+                3,
+                "member {m} must have 3 colon-separated parts"
+            );
+            assert!(
+                parts[0].parse::<u64>().is_ok(),
+                "part 0 must be usec timestamp"
+            );
+            assert_eq!(parts[1].len(), 32, "part 1 must be 32-hex-char nonce");
+            let idx = parts[2].parse::<u32>().expect("part 2 must be hit index");
+            assert!(idx >= 1 && idx <= hits_per_req as u32);
+        }
+
+        // Clean up
+        let _: () = redis::cmd("DEL").arg(&key).query(&mut conn).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sliding_window_prunes_expired_entries_and_respects_10000_event_cap() {
+        use super::HitOperation;
+
+        let domain = "sliding_window_bounds";
+        let config_json = format!(
+            r#"{{
+            "domain": "{domain}",
+            "descriptors": [
+                {{
+                    "key": "api",
+                    "value": "search",
+                    "rate_limit": {{ "algorithm": "sliding_window", "unit": "minutes", "requests_per_unit": 20000 }}
+                }}
+            ]
+        }}"#
+        );
+
+        let Some((_server, steward, client)) = setup_test_steward(&config_json).await else {
+            eprintln!("Skipping test: redis-server not available");
+            return;
+        };
+
+        let mut conn = client.get_connection().unwrap();
+        let active_cfg = steward.active_config();
+        let domain_policy = active_cfg.domains.get(domain).unwrap();
+        let matched = domain_policy.match_entries(&[("api", "search")]).unwrap();
+        let limit = matched.rate_limits[0];
+        let path = encode_canonical_path([("api", "search")]);
+        let key = rate_limit_key(domain, matched.policy_id, &path, &limit, 10);
+
+        // Fetch current Redis time
+        let redis_time: (i64, i64) = redis::cmd("TIME").query(&mut conn).unwrap();
+        let now_ms = (redis_time.0 * 1000) + (redis_time.1 / 1000);
+
+        // --- Part A: Prune expired entries ---
+        // Insert 5 expired entries with score 120 seconds in the past (> 60s window)
+        let expired_score = now_ms - 120_000;
+        for i in 0..5 {
+            let _: () = redis::cmd("ZADD")
+                .arg(&key)
+                .arg(expired_score)
+                .arg(format!("expired:{i}"))
+                .query(&mut conn)
+                .unwrap();
+        }
+        // Insert 3 fresh entries with score now_ms
+        for i in 0..3 {
+            let _: () = redis::cmd("ZADD")
+                .arg(&key)
+                .arg(now_ms)
+                .arg(format!("fresh:{i}"))
+                .query(&mut conn)
+                .unwrap();
+        }
+        assert_eq!(
+            redis::cmd("ZCARD")
+                .arg(&key)
+                .query::<i64>(&mut conn)
+                .unwrap(),
+            8
+        );
+
+        // Execute sliding window check with 2 hits (window = 60s -> expired entries must be pruned)
+        let decision = steward
+            .check_limit(&key, &limit, HitOperation::Consume(2))
+            .await
+            .unwrap();
+        assert!(decision.allowed);
+        // Observed should be 3 fresh + 2 new = 5 (the 5 expired were pruned)
+        assert_eq!(decision.observed, 5);
+        let card: i64 = redis::cmd("ZCARD").arg(&key).query(&mut conn).unwrap();
+        assert_eq!(card, 5);
+
+        // --- Part B: Enforce max retention bound of 10,000 events ---
+        // Clear key first
+        let _: () = redis::cmd("DEL").arg(&key).query(&mut conn).unwrap();
+
+        // Re-fetch authoritative Redis time
+        let redis_time: (i64, i64) = redis::cmd("TIME").query(&mut conn).unwrap();
+        let now_ms = (redis_time.0 * 1000) + (redis_time.1 / 1000);
+        let seed_score = now_ms - 5_000; // 5s ago (within 60s window, but older than new hits)
+
+        // Seed sorted set with exactly 10,000 items
+        let mut cmd = redis::cmd("ZADD");
+        cmd.arg(&key);
+        for i in 0..10_000 {
+            cmd.arg(seed_score).arg(format!("seed:{i:05}"));
+        }
+        let _: () = cmd.query(&mut conn).unwrap();
+        assert_eq!(
+            redis::cmd("ZCARD")
+                .arg(&key)
+                .query::<i64>(&mut conn)
+                .unwrap(),
+            10_000
+        );
+
+        // Add 10 hits via sliding window script (limit is 20,000, so allowed)
+        let decision = steward
+            .check_limit(&key, &limit, HitOperation::Consume(10))
+            .await
+            .unwrap();
+        assert!(decision.allowed);
+        assert_eq!(decision.observed, 10_000);
+
+        // Redis cardinality must be trimmed to exactly 10,000
+        let card: i64 = redis::cmd("ZCARD").arg(&key).query(&mut conn).unwrap();
+        assert_eq!(card, 10_000);
+
+        // Oldest entries (seed:00000 to seed:00009) must have been trimmed by ZREMRANGEBYRANK
+        for i in 0..10 {
+            let score: Option<f64> = redis::cmd("ZSCORE")
+                .arg(&key)
+                .arg(format!("seed:{i:05}"))
+                .query(&mut conn)
+                .unwrap();
+            assert!(score.is_none(), "seed:{i:05} must have been trimmed");
+        }
+        // Entry seed:00010 must still exist
+        let score_10: Option<f64> = redis::cmd("ZSCORE")
+            .arg(&key)
+            .arg("seed:00010")
+            .query(&mut conn)
+            .unwrap();
+        assert!(score_10.is_some(), "seed:00010 must be retained");
+
+        // Clean up
+        let _: () = redis::cmd("DEL").arg(&key).query(&mut conn).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn token_bucket_withstands_simulated_clock_regressions_without_extra_refills() {
+        use super::HitOperation;
+
+        let domain = "token_bucket_clock_regression";
+        let config_json = format!(
+            r#"{{
+            "domain": "{domain}",
+            "descriptors": [
+                {{
+                    "key": "action",
+                    "value": "transfer",
+                    "rate_limit": {{ "algorithm": "token_bucket", "unit": "seconds", "requests_per_unit": 10 }}
+                }}
+            ]
+        }}"#
+        );
+
+        let Some((_server, steward, client)) = setup_test_steward(&config_json).await else {
+            eprintln!("Skipping test: redis-server not available");
+            return;
+        };
+
+        let mut conn = client.get_connection().unwrap();
+        let active_cfg = steward.active_config();
+        let domain_policy = active_cfg.domains.get(domain).unwrap();
+        let matched = domain_policy
+            .match_entries(&[("action", "transfer")])
+            .unwrap();
+        let limit = matched.rate_limits[0];
+        let path = encode_canonical_path([("action", "transfer")]);
+        let key = rate_limit_key(domain, matched.policy_id, &path, &limit, 10);
+
+        // 1. Initial consumption: consume 8 tokens out of 10 capacity -> 2 tokens remaining
+        let d1 = steward
+            .check_limit(&key, &limit, HitOperation::Consume(8))
+            .await
+            .unwrap();
+        assert!(d1.allowed);
+        assert_eq!(d1.observed, 2);
+
+        // Read current stored timestamp from Redis
+        let state: (Option<f64>, Option<i64>) = redis::cmd("HMGET")
+            .arg(&key)
+            .arg("tokens")
+            .arg("timestamp_ms")
+            .query(&mut conn)
+            .unwrap();
+        let initial_ts = state.1.unwrap();
+
+        // 2. Simulate clock regression: write a future timestamp (initial_ts + 60,000ms) with 2 tokens
+        let future_ts = initial_ts + 60_000;
+        let _: () = redis::cmd("HSET")
+            .arg(&key)
+            .arg("tokens")
+            .arg(2.0)
+            .arg("timestamp_ms")
+            .arg(future_ts)
+            .query(&mut conn)
+            .unwrap();
+
+        // 3. Attempt to consume 3 tokens when Redis TIME is still around initial_ts (< future_ts)
+        // With clock drift protection, now_ms is clamped to last (future_ts), elapsed is 0, no refill happens!
+        // 2 tokens < 3 cost -> must be rejected
+        let d2 = steward
+            .check_limit(&key, &limit, HitOperation::Consume(3))
+            .await
+            .unwrap();
+        assert!(
+            !d2.allowed,
+            "request for 3 tokens should be denied when only 2 tokens exist"
+        );
+        assert_eq!(d2.observed, 2);
+
+        // Stored timestamp must NOT regress backwards to now_ms
+        let state2: (Option<f64>, Option<i64>) = redis::cmd("HMGET")
+            .arg(&key)
+            .arg("tokens")
+            .arg("timestamp_ms")
+            .query(&mut conn)
+            .unwrap();
+        assert_eq!(
+            state2.1.unwrap(),
+            future_ts,
+            "timestamp must not move backwards"
+        );
+
+        // 4. Consume 1 token -> should succeed and leave 1 token
+        let d3 = steward
+            .check_limit(&key, &limit, HitOperation::Consume(1))
+            .await
+            .unwrap();
+        assert!(d3.allowed);
+        assert_eq!(d3.observed, 1);
+
+        // Verify stored timestamp is still >= future_ts
+        let state3: (Option<f64>, Option<i64>) = redis::cmd("HMGET")
+            .arg(&key)
+            .arg("tokens")
+            .arg("timestamp_ms")
+            .query(&mut conn)
+            .unwrap();
+        assert!(state3.1.unwrap() >= future_ts);
+
+        // Clean up
+        let _: () = redis::cmd("DEL").arg(&key).query(&mut conn).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn requests_exceeding_max_sliding_hit_cost_are_rejected() {
+        use super::HitOperation;
+        use crate::proto::envoy::extensions::common::ratelimit::v3::{
+            RateLimitDescriptor, rate_limit_descriptor::Entry,
+        };
+        use crate::proto::envoy::service::ratelimit::v3::RateLimitRequest;
+        use crate::proto::envoy::service::ratelimit::v3::rate_limit_service_server::RateLimitService;
+
+        let domain = "sliding_max_cost";
+        let config_json = format!(
+            r#"{{
+            "domain": "{domain}",
+            "descriptors": [
+                {{
+                    "key": "endpoint",
+                    "value": "batch",
+                    "rate_limit": {{ "algorithm": "sliding_window", "unit": "seconds", "requests_per_unit": 500 }}
+                }}
+            ]
+        }}"#
+        );
+
+        let Some((_server, steward, client)) = setup_test_steward(&config_json).await else {
+            eprintln!("Skipping test: redis-server not available");
+            return;
+        };
+
+        let mut conn = client.get_connection().unwrap();
+        let active_cfg = steward.active_config();
+        let domain_policy = active_cfg.domains.get(domain).unwrap();
+        let matched = domain_policy
+            .match_entries(&[("endpoint", "batch")])
+            .unwrap();
+        let limit = matched.rate_limits[0];
+        let path = encode_canonical_path([("endpoint", "batch")]);
+        let key = rate_limit_key(domain, matched.policy_id, &path, &limit, 10);
+
+        // 1. gRPC request with hits_addend = 101 must be rejected before Redis execution
+        let req1 = RateLimitRequest {
+            domain: domain.to_string(),
+            descriptors: vec![RateLimitDescriptor {
+                entries: vec![Entry {
+                    key: "endpoint".to_string(),
+                    value: "batch".to_string(),
+                }],
+                limit: None,
+                hits_addend: None,
+                is_negative_hits: false,
+            }],
+            hits_addend: 101,
+        };
+        let err1 = steward
+            .should_rate_limit(tonic::Request::new(req1))
+            .await
+            .unwrap_err();
+        assert_eq!(err1.code(), tonic::Code::InvalidArgument);
+        assert!(err1.message().contains("exceeds maximum of 100"));
+
+        // 2. gRPC request with descriptor hits_addend = 101 must be rejected before Redis execution
+        let req2 = RateLimitRequest {
+            domain: domain.to_string(),
+            descriptors: vec![RateLimitDescriptor {
+                entries: vec![Entry {
+                    key: "endpoint".to_string(),
+                    value: "batch".to_string(),
+                }],
+                limit: None,
+                hits_addend: Some(101),
+                is_negative_hits: false,
+            }],
+            hits_addend: 0,
+        };
+        let err2 = steward
+            .should_rate_limit(tonic::Request::new(req2))
+            .await
+            .unwrap_err();
+        assert_eq!(err2.code(), tonic::Code::InvalidArgument);
+        assert!(err2.message().contains("exceeds maximum of 100"));
+
+        // 3. check_limit called directly with hits = 101 on sliding window must be rejected
+        let err3 = steward
+            .check_limit(&key, &limit, HitOperation::Consume(101))
+            .await
+            .unwrap_err();
+        assert!(err3.to_string().contains("exceeds maximum of 100"));
+
+        // Verify no elements were added to Redis
+        let card: i64 = redis::cmd("ZCARD").arg(&key).query(&mut conn).unwrap();
+        assert_eq!(card, 0);
+
+        // 4. Lua script directly invoked with hits = 101 returns { 0, 0 }
+        let mut conn_async = client.get_connection_manager().await.unwrap();
+        let outcome: super::ScriptOutcome = steward
+            .scripts
+            .sliding_window
+            .key(&key)
+            .arg(10_000)
+            .arg(500)
+            .arg(101)
+            .arg("test-nonce")
+            .invoke_async(&mut conn_async)
+            .await
+            .unwrap();
+        assert!(!outcome.allowed);
+        assert_eq!(outcome.observed, 0);
+    }
+
+    #[test]
+    fn script_outcome_strong_typing_and_deserialization_validation() {
+        use super::ScriptOutcome;
+        use redis::FromRedisValue;
+
+        // 1. Valid allowed outcome: [1, 42]
+        let val_allowed = redis::Value::Array(vec![redis::Value::Int(1), redis::Value::Int(42)]);
+        let outcome = ScriptOutcome::from_redis_value(val_allowed).expect("must parse [1, 42]");
+        assert!(outcome.allowed);
+        assert_eq!(outcome.observed, 42);
+
+        // 2. Valid denied outcome: [0, 10]
+        let val_denied = redis::Value::Array(vec![redis::Value::Int(0), redis::Value::Int(10)]);
+        let outcome = ScriptOutcome::from_redis_value(val_denied).expect("must parse [0, 10]");
+        assert!(!outcome.allowed);
+        assert_eq!(outcome.observed, 10);
+
+        // 3. Incomplete array with only 1 element -> ParsingError
+        let val_short = redis::Value::Array(vec![redis::Value::Int(1)]);
+        assert!(ScriptOutcome::from_redis_value(val_short).is_err());
+
+        // 4. Empty array -> ParsingError
+        let val_empty = redis::Value::Array(vec![]);
+        assert!(ScriptOutcome::from_redis_value(val_empty).is_err());
+
+        // 5. Nil value -> ParsingError
+        let val_nil = redis::Value::Nil;
+        assert!(ScriptOutcome::from_redis_value(val_nil).is_err());
+
+        // 6. Conversion to Decision
+        let decision: super::Decision = outcome.into();
+        assert_eq!(decision.allowed, outcome.allowed);
+        assert_eq!(decision.observed, outcome.observed);
     }
 }
