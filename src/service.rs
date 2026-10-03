@@ -391,6 +391,27 @@ impl Steward {
         }
     }
 
+    async fn invoke_with_noscript_recovery<'a, T, F>(
+        script: &'a Script,
+        conn: &mut ConnectionManager,
+        build: F,
+    ) -> redis::RedisResult<T>
+    where
+        T: redis::FromRedisValue,
+        F: Fn() -> redis::ScriptInvocation<'a>,
+    {
+        let mut cloned_conn = conn.clone();
+        match build().invoke_async(&mut cloned_conn).await {
+            Ok(res) => Ok(res),
+            Err(err) if err.to_string().contains("NOSCRIPT") => {
+                tracing::warn!("NOSCRIPT detected; reloading script into Redis and retrying");
+                script.load_async(&mut cloned_conn).await?;
+                build().invoke_async(&mut cloned_conn).await
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     pub async fn check_limit(
         &self,
         key: &str,
@@ -466,13 +487,16 @@ impl Steward {
             },
             HitOperation::Refund(hits) => match limit.algorithm {
                 Algorithm::FixedWindow => {
-                    let current: i64 = self
-                        .scripts
-                        .fixed_window_refund
-                        .key(key)
-                        .arg(hits as i64)
-                        .invoke_async(&mut connection)
-                        .await?;
+                    let current: i64 = Self::invoke_with_noscript_recovery(
+                        &self.scripts.fixed_window_refund,
+                        &mut connection,
+                        || {
+                            let mut inv = self.scripts.fixed_window_refund.key(key);
+                            inv.arg(hits as i64);
+                            inv
+                        },
+                    )
+                    .await?;
                     Ok(Decision {
                         allowed: true,
                         observed: current,
@@ -482,16 +506,19 @@ impl Steward {
                     let window_ms = window_seconds.saturating_mul(1_000).max(1);
                     let capacity = limit.requests_per_unit as f64;
                     let refill_per_ms = capacity / window_ms as f64;
-                    let outcome: ScriptOutcome = self
-                        .scripts
-                        .token_bucket_refund
-                        .key(key)
-                        .arg(capacity)
-                        .arg(refill_per_ms)
-                        .arg(hits as i64)
-                        .arg(window_ms)
-                        .invoke_async(&mut connection)
-                        .await?;
+                    let outcome: ScriptOutcome = Self::invoke_with_noscript_recovery(
+                        &self.scripts.token_bucket_refund,
+                        &mut connection,
+                        || {
+                            let mut inv = self.scripts.token_bucket_refund.key(key);
+                            inv.arg(capacity);
+                            inv.arg(refill_per_ms);
+                            inv.arg(hits as i64);
+                            inv.arg(window_ms);
+                            inv
+                        },
+                    )
+                    .await?;
                     Ok(outcome.into())
                 }
                 Algorithm::SlidingWindow => Err(redis::RedisError::from((
@@ -503,14 +530,17 @@ impl Steward {
                 let hits = hits as i64;
                 match limit.algorithm {
                     Algorithm::FixedWindow => {
-                        let current: i64 = self
-                            .scripts
-                            .fixed_window
-                            .key(key)
-                            .arg(hits)
-                            .arg(window_seconds)
-                            .invoke_async(&mut connection)
-                            .await?;
+                        let current: i64 = Self::invoke_with_noscript_recovery(
+                            &self.scripts.fixed_window,
+                            &mut connection,
+                            || {
+                                let mut inv = self.scripts.fixed_window.key(key);
+                                inv.arg(hits);
+                                inv.arg(window_seconds);
+                                inv
+                            },
+                        )
+                        .await?;
                         Ok(Decision {
                             allowed: current <= limit.requests_per_unit,
                             observed: current,
@@ -520,16 +550,19 @@ impl Steward {
                         let window_ms = window_seconds.saturating_mul(1_000).max(1);
                         let capacity = limit.requests_per_unit as f64;
                         let refill_per_ms = capacity / window_ms as f64;
-                        let outcome: ScriptOutcome = self
-                            .scripts
-                            .token_bucket
-                            .key(key)
-                            .arg(capacity)
-                            .arg(refill_per_ms)
-                            .arg(hits)
-                            .arg(window_ms)
-                            .invoke_async(&mut connection)
-                            .await?;
+                        let outcome: ScriptOutcome = Self::invoke_with_noscript_recovery(
+                            &self.scripts.token_bucket,
+                            &mut connection,
+                            || {
+                                let mut inv = self.scripts.token_bucket.key(key);
+                                inv.arg(capacity);
+                                inv.arg(refill_per_ms);
+                                inv.arg(hits);
+                                inv.arg(window_ms);
+                                inv
+                            },
+                        )
+                        .await?;
                         Ok(outcome.into())
                     }
                     Algorithm::SlidingWindow => {
@@ -541,16 +574,19 @@ impl Steward {
                         }
                         let window_ms = window_seconds.saturating_mul(1_000).max(1);
                         let nonce = generate_sliding_window_nonce();
-                        let outcome: ScriptOutcome = self
-                            .scripts
-                            .sliding_window
-                            .key(key)
-                            .arg(window_ms)
-                            .arg(limit.requests_per_unit)
-                            .arg(hits)
-                            .arg(nonce)
-                            .invoke_async(&mut connection)
-                            .await?;
+                        let outcome: ScriptOutcome = Self::invoke_with_noscript_recovery(
+                            &self.scripts.sliding_window,
+                            &mut connection,
+                            || {
+                                let mut inv = self.scripts.sliding_window.key(key);
+                                inv.arg(window_ms);
+                                inv.arg(limit.requests_per_unit);
+                                inv.arg(hits);
+                                inv.arg(&nonce);
+                                inv
+                            },
+                        )
+                        .await?;
                         Ok(outcome.into())
                     }
                 }
@@ -962,41 +998,45 @@ impl RateLimitService for Steward {
         // 4. Redis Evaluation Phase (wrapped in bounded timeout, preserving 1:1 input descriptor order)
         let default_ttl = self.default_ttl;
         let eval_result = tokio::time::timeout(effective_timeout, async {
-            let mut statuses = Vec::with_capacity(evaluations.len());
-            let mut any_rule_over_limit = false;
-            let mut first_redis_error = None;
-
-            for eval in evaluations {
+            let eval_futures = evaluations.into_iter().map(|eval| async move {
                 match eval {
                     DescriptorEvaluation::Unmatched => {
                         count(&self.metrics, "descriptors.unmatched", 1);
-                        statuses.push(DescriptorStatus {
+                        let status = DescriptorStatus {
                             code: Code::Ok as i32,
                             current_limit: None,
                             limit_remaining: 0,
                             duration_until_reset: None,
                             quota: None,
-                        });
+                        };
+                        (status, false, None)
                     }
                     DescriptorEvaluation::Matched(desc_match) => {
-                        let mut successful_decisions =
-                            Vec::with_capacity(desc_match.limits_to_check.len());
-                        let mut failed_rules = Vec::new();
+                        let rule_futures = desc_match.limits_to_check.iter().map(|(key, limit)| {
+                            let op = desc_match.operation;
+                            async move {
+                                let result = self.execute_check_limit(key, limit, op).await;
+                                (limit, result)
+                            }
+                        });
+                        let rule_results = futures_util::future::join_all(rule_futures).await;
 
-                        for (key, limit) in &desc_match.limits_to_check {
-                            let result = self
-                                .execute_check_limit(key, limit, desc_match.operation)
-                                .await;
-                            match result {
+                        let mut successful_decisions = Vec::with_capacity(rule_results.len());
+                        let mut failed_rules = Vec::new();
+                        let mut desc_over_limit = false;
+                        let mut desc_redis_error = None;
+
+                        for (limit, res) in rule_results {
+                            match res {
                                 Ok(decision) => {
                                     if !decision.allowed {
-                                        any_rule_over_limit = true;
+                                        desc_over_limit = true;
                                     }
                                     successful_decisions.push((limit, decision));
                                 }
                                 Err(error) => {
-                                    if first_redis_error.is_none() {
-                                        first_redis_error = Some(error.clone());
+                                    if desc_redis_error.is_none() {
+                                        desc_redis_error = Some(error.clone());
                                     }
                                     failed_rules.push((limit, error));
                                 }
@@ -1006,26 +1046,24 @@ impl RateLimitService for Steward {
                         let has_over_limit =
                             successful_decisions.iter().any(|(_, dec)| !dec.allowed);
 
-                        if has_over_limit {
+                        let status = if has_over_limit {
                             let violated: Vec<(&RateLimit, &Decision)> = successful_decisions
                                 .iter()
                                 .filter(|(_, dec)| !dec.allowed)
                                 .map(|(l, d)| (*l, d))
                                 .collect();
-                            let status = aggregate_descriptor_status(&violated, default_ttl);
-                            statuses.push(status);
+                            aggregate_descriptor_status(&violated, default_ttl)
                         } else if failed_rules.is_empty() {
                             let pairs: Vec<(&RateLimit, &Decision)> =
                                 successful_decisions.iter().map(|(l, d)| (*l, d)).collect();
-                            let status = aggregate_descriptor_status(&pairs, default_ttl);
-                            statuses.push(status);
+                            aggregate_descriptor_status(&pairs, default_ttl)
                         } else {
                             let gov_limit = successful_decisions
                                 .first()
                                 .map(|(l, _)| **l)
                                 .unwrap_or(desc_match.limits_to_check[0].1);
                             let reset_secs = duration_until_reset_for(&gov_limit, default_ttl);
-                            statuses.push(DescriptorStatus {
+                            DescriptorStatus {
                                 code: Code::Unknown as i32,
                                 current_limit: Some(gov_limit.to_proto()),
                                 limit_remaining: 0,
@@ -1034,9 +1072,27 @@ impl RateLimitService for Steward {
                                     nanos: 0,
                                 }),
                                 quota: None,
-                            });
-                        }
+                            }
+                        };
+
+                        (status, desc_over_limit, desc_redis_error)
                     }
+                }
+            });
+
+            let descriptor_results = futures_util::future::join_all(eval_futures).await;
+
+            let mut statuses = Vec::with_capacity(descriptor_results.len());
+            let mut any_rule_over_limit = false;
+            let mut first_redis_error = None;
+
+            for (status, over_limit, redis_err) in descriptor_results {
+                statuses.push(status);
+                if over_limit {
+                    any_rule_over_limit = true;
+                }
+                if first_redis_error.is_none() && redis_err.is_some() {
+                    first_redis_error = redis_err;
                 }
             }
 
@@ -5388,5 +5444,212 @@ mod tests {
         // ZCARD in Redis must remain strictly 6
         let card_after: i64 = redis::cmd("ZCARD").arg(&key).query(&mut conn).unwrap();
         assert_eq!(card_after, 6);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_multi_rule_evaluation_and_ordering() {
+        use crate::proto::envoy::extensions::common::ratelimit::v3::{
+            RateLimitDescriptor, rate_limit_descriptor::Entry,
+        };
+        use crate::proto::envoy::service::ratelimit::v3::RateLimitRequest;
+        use crate::proto::envoy::service::ratelimit::v3::rate_limit_service_server::RateLimitService;
+
+        let domain = "domain_concurrent_eval";
+        let config_json = format!(
+            r#"{{
+            "domain": "{domain}",
+            "descriptors": [
+                {{
+                    "key": "tier",
+                    "value": "gold",
+                    "rate_limit": {{ "unit": "seconds", "requests_per_unit": 5 }}
+                }},
+                {{
+                    "key": "tier",
+                    "value": "silver",
+                    "rate_limit": {{ "unit": "seconds", "requests_per_unit": 10 }}
+                }},
+                {{
+                    "key": "tier",
+                    "value": "bronze",
+                    "rate_limit": {{ "unit": "seconds", "requests_per_unit": 1 }}
+                }}
+            ]
+        }}"#
+        );
+
+        let Some((_server, steward, client)) = setup_test_steward(&config_json).await else {
+            eprintln!("Skipping test: redis-server not available");
+            return;
+        };
+
+        let mut conn = client.get_connection_manager().await.unwrap();
+        let _: () = redis::cmd("FLUSHDB").query_async(&mut conn).await.unwrap();
+
+        // Send a request with 4 descriptors: gold, bronze (consume 2 hits -> will be over limit), silver, unmatched
+        let request = RateLimitRequest {
+            domain: domain.to_string(),
+            descriptors: vec![
+                RateLimitDescriptor {
+                    entries: vec![Entry {
+                        key: "tier".to_string(),
+                        value: "gold".to_string(),
+                    }],
+                    limit: None,
+                    hits_addend: Some(1),
+                    is_negative_hits: false,
+                },
+                RateLimitDescriptor {
+                    entries: vec![Entry {
+                        key: "tier".to_string(),
+                        value: "bronze".to_string(),
+                    }],
+                    limit: None,
+                    hits_addend: Some(2), // exceeds limit of 1
+                    is_negative_hits: false,
+                },
+                RateLimitDescriptor {
+                    entries: vec![Entry {
+                        key: "tier".to_string(),
+                        value: "silver".to_string(),
+                    }],
+                    limit: None,
+                    hits_addend: Some(1),
+                    is_negative_hits: false,
+                },
+                RateLimitDescriptor {
+                    entries: vec![Entry {
+                        key: "unmatched".to_string(),
+                        value: "none".to_string(),
+                    }],
+                    limit: None,
+                    hits_addend: Some(1),
+                    is_negative_hits: false,
+                },
+            ],
+            hits_addend: 0,
+        };
+
+        let response = steward
+            .should_rate_limit(tonic::Request::new(request))
+            .await
+            .unwrap()
+            .into_inner();
+
+        // Strict 1:1 descriptor ordering:
+        assert_eq!(response.statuses.len(), 4);
+        assert_eq!(response.statuses[0].code, Code::Ok as i32); // gold: 1/5 ok
+        assert_eq!(response.statuses[1].code, Code::OverLimit as i32); // bronze: 2/1 over limit
+        assert_eq!(response.statuses[2].code, Code::Ok as i32); // silver: 1/10 ok
+        assert_eq!(response.statuses[3].code, Code::Ok as i32); // unmatched: unconstrained ok
+        assert_eq!(response.statuses[3].current_limit, None);
+
+        // F06 Precedence: Bronze was over limit -> overall code must be OVER_LIMIT
+        assert_eq!(response.overall_code, Code::OverLimit as i32);
+    }
+
+    #[tokio::test]
+    async fn test_noscript_cache_recovery_after_script_flush() {
+        use crate::proto::envoy::extensions::common::ratelimit::v3::{
+            RateLimitDescriptor, rate_limit_descriptor::Entry,
+        };
+        use crate::proto::envoy::service::ratelimit::v3::RateLimitRequest;
+        use crate::proto::envoy::service::ratelimit::v3::rate_limit_service_server::RateLimitService;
+
+        let domain = "domain_noscript_recovery";
+        let config_json = format!(
+            r#"{{
+            "domain": "{domain}",
+            "descriptors": [
+                {{
+                    "key": "algo",
+                    "value": "fixed",
+                    "rate_limit": {{ "algorithm": "fixed_window", "unit": "seconds", "requests_per_unit": 10 }}
+                }},
+                {{
+                    "key": "algo",
+                    "value": "token",
+                    "rate_limit": {{ "algorithm": "token_bucket", "unit": "seconds", "requests_per_unit": 10 }}
+                }},
+                {{
+                    "key": "algo",
+                    "value": "sliding",
+                    "rate_limit": {{ "algorithm": "sliding_window", "unit": "seconds", "requests_per_unit": 10 }}
+                }}
+            ]
+        }}"#
+        );
+
+        let Some((_server, steward, client)) = setup_test_steward(&config_json).await else {
+            eprintln!("Skipping test: redis-server not available");
+            return;
+        };
+
+        let mut conn = client.get_connection_manager().await.unwrap();
+        let _: () = redis::cmd("FLUSHDB").query_async(&mut conn).await.unwrap();
+
+        // Step 1: Initial request to warm up and load scripts into Redis
+        let warm_req = RateLimitRequest {
+            domain: domain.to_string(),
+            descriptors: vec![
+                RateLimitDescriptor {
+                    entries: vec![Entry {
+                        key: "algo".to_string(),
+                        value: "fixed".to_string(),
+                    }],
+                    limit: None,
+                    hits_addend: Some(1),
+                    is_negative_hits: false,
+                },
+                RateLimitDescriptor {
+                    entries: vec![Entry {
+                        key: "algo".to_string(),
+                        value: "token".to_string(),
+                    }],
+                    limit: None,
+                    hits_addend: Some(1),
+                    is_negative_hits: false,
+                },
+                RateLimitDescriptor {
+                    entries: vec![Entry {
+                        key: "algo".to_string(),
+                        value: "sliding".to_string(),
+                    }],
+                    limit: None,
+                    hits_addend: Some(1),
+                    is_negative_hits: false,
+                },
+            ],
+            hits_addend: 0,
+        };
+
+        let res1 = steward
+            .should_rate_limit(tonic::Request::new(warm_req.clone()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(res1.overall_code, Code::Ok as i32);
+        assert_eq!(res1.statuses.len(), 3);
+
+        // Step 2: Flush all cached Lua scripts from Redis (simulating Redis restart / script cache flush)
+        let _: () = redis::cmd("SCRIPT")
+            .arg("FLUSH")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+
+        // Step 3: Immediately send subsequent concurrent requests across all algorithms
+        // Steward must catch NOSCRIPT, reload scripts into Redis, and succeed without errors
+        let res2 = steward
+            .should_rate_limit(tonic::Request::new(warm_req))
+            .await
+            .expect("RateLimit request must succeed after SCRIPT FLUSH via transparent recovery")
+            .into_inner();
+
+        assert_eq!(res2.overall_code, Code::Ok as i32);
+        assert_eq!(res2.statuses.len(), 3);
+        assert_eq!(res2.statuses[0].code, Code::Ok as i32);
+        assert_eq!(res2.statuses[1].code, Code::Ok as i32);
+        assert_eq!(res2.statuses[2].code, Code::Ok as i32);
     }
 }
