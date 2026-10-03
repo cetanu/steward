@@ -872,4 +872,55 @@ mod tests {
         handle.abort();
         let _ = std::fs::remove_file(file_path);
     }
+
+    #[tokio::test]
+    async fn startup_fails_and_stays_unready_on_invalid_config() {
+        // 1. Missing configuration file fails initial load
+        let missing_source = ConfigSource::File("/non/existent/path/for/config.json".to_string());
+        let res_missing = load_rate_limits(&missing_source).await;
+        assert!(
+            res_missing.is_err(),
+            "missing configuration file must fail initial load"
+        );
+
+        // 2. Malformed JSON syntax in configuration file fails initial load
+        let temp_dir = std::env::temp_dir();
+        let file_path = temp_dir.join(format!(
+            "steward_invalid_syntax_{}_{}.json",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&file_path, "{ invalid json: syntax error }").unwrap();
+        let syntax_source = ConfigSource::File(file_path.to_str().unwrap().to_string());
+        let res_syntax = load_rate_limits(&syntax_source).await;
+        assert!(
+            res_syntax.is_err(),
+            "malformed JSON syntax must fail initial load"
+        );
+        let _ = std::fs::remove_file(&file_path);
+
+        // 3. Invalid rate-limit policy (zero requests_per_unit) fails compile-time validation
+        let file_path_val = temp_dir.join(format!(
+            "steward_invalid_val_{}_{}.json",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(
+            &file_path_val,
+            r#"{"domain": "default", "descriptors": [{"key": "k", "rate_limit": {"unit": "seconds", "requests_per_unit": 0}}]}"#,
+        ).unwrap();
+        let val_source = ConfigSource::File(file_path_val.to_str().unwrap().to_string());
+        let res_val = load_rate_limits(&val_source).await;
+        assert!(
+            res_val.is_err(),
+            "zero requests_per_unit must fail startup validation"
+        );
+        let _ = std::fs::remove_file(&file_path_val);
+    }
 }
