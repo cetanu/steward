@@ -24,6 +24,7 @@ async fn envoy_allows_requests_then_returns_rate_limit_response() {
             .send()
             .await
             && response.status().is_success()
+            && response.headers().contains_key("x-ratelimit-limit")
         {
             ready = true;
             break;
@@ -33,9 +34,11 @@ async fn envoy_allows_requests_then_returns_rate_limit_response() {
 
     if !ready {
         if std::env::var("CI").is_ok() {
-            panic!("Envoy did not become ready");
+            panic!("Envoy did not become ready with active rate limit enforcement");
         } else {
-            eprintln!("Skipping integration test: Envoy not reachable at {ENVOY_URL}");
+            eprintln!(
+                "Skipping integration test: Envoy not reachable or not rate limiting at {ENVOY_URL}"
+            );
             return;
         }
     }

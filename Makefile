@@ -7,13 +7,13 @@ build:
 	cargo build --release --locked --bin steward
 
 daemonize:
-	$(COMPOSE) up --detach --force-recreate --build server envoy
+	$(COMPOSE) up --detach --force-recreate --build
 
 daemonize-prebuilt: build
-	$(COMPOSE) -f docker-compose.yml -f docker-compose.prebuilt.yml up --detach --force-recreate --build server envoy
+	$(COMPOSE) -f docker-compose.yml -f docker-compose.prebuilt.yml up --detach --force-recreate --build
 
 logs:
-	$(COMPOSE) logs server envoy
+	$(COMPOSE) logs
 
 run: clean
 	$(COMPOSE) up --detach --build envoy

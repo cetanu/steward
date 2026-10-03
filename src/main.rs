@@ -8,7 +8,9 @@ use tonic::transport::Server;
 use tracing::info;
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
-use steward::config_source::{Settings, load_rate_limits, spawn_supervised_config_loader};
+use std::time::Duration;
+
+use steward::config_source::{Settings, load_initial_rate_limits, spawn_supervised_config_loader};
 use steward::metrics::build_metrics;
 use steward::proto::envoy::service::ratelimit::v3::rate_limit_service_server::RateLimitServiceServer;
 use steward::service::Steward;
@@ -30,7 +32,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let metrics = build_metrics(settings.metrics.as_ref())?;
 
     info!("loading initial rate-limit configuration");
-    let initial_config = load_rate_limits(&settings.rate_limit_configs)
+    let startup_budget = Duration::from_secs(settings.startup_timeout_secs);
+    let initial_config = load_initial_rate_limits(&settings.rate_limit_configs, startup_budget)
         .await
         .map_err(|error| format!("initial configuration load failed: {error}"))?;
 

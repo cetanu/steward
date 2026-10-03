@@ -311,6 +311,44 @@ pub async fn load_rate_limits(source: &ConfigSource) -> Result<Arc<CompiledConfi
     }
 }
 
+pub async fn load_initial_rate_limits(
+    source: &ConfigSource,
+    startup_budget: Duration,
+) -> Result<Arc<CompiledConfig>, String> {
+    if startup_budget.is_zero() {
+        return load_rate_limits(source).await;
+    }
+    let start = std::time::Instant::now();
+    let mut attempt = 0;
+    let mut backoff = Duration::from_millis(250);
+
+    loop {
+        attempt += 1;
+        match load_rate_limits(source).await {
+            Ok(config) => return Ok(config),
+            Err(err) => {
+                let elapsed = start.elapsed();
+                if elapsed >= startup_budget {
+                    return Err(format!(
+                        "initial configuration load failed after {elapsed:?} ({attempt} attempts): {err}"
+                    ));
+                }
+                let remaining = startup_budget.saturating_sub(elapsed);
+                tracing::warn!(
+                    attempt,
+                    elapsed_ms = elapsed.as_millis(),
+                    remaining_ms = remaining.as_millis(),
+                    error = %err,
+                    "waiting for initial configuration (retrying)..."
+                );
+                let sleep_duration = backoff.min(remaining).min(Duration::from_secs(2));
+                tokio::time::sleep(sleep_duration).await;
+                backoff = (backoff * 2).min(Duration::from_secs(2));
+            }
+        }
+    }
+}
+
 pub async fn load_rate_limits_with_client(
     source: &ConfigSource,
     http_client: Option<&reqwest::Client>,
@@ -703,6 +741,8 @@ pub struct Settings {
     pub execution_timeout_ms: u64,
     #[serde(default = "default_max_concurrent_requests")]
     pub max_concurrent_requests: usize,
+    #[serde(default = "default_startup_timeout_secs")]
+    pub startup_timeout_secs: u64,
     #[serde(default)]
     pub tls: Option<TlsSettings>,
 }
@@ -796,6 +836,10 @@ fn default_execution_timeout_ms() -> u64 {
 
 fn default_max_concurrent_requests() -> usize {
     1_024
+}
+
+fn default_startup_timeout_secs() -> u64 {
+    30
 }
 
 fn default_redis_connections() -> Option<usize> {
@@ -1423,6 +1467,7 @@ mod tests {
             metrics: None,
             execution_timeout_ms: 10,
             max_concurrent_requests: 1024,
+            startup_timeout_secs: 30,
             tls: None,
         };
 
@@ -1822,5 +1867,108 @@ redis_host: 127.0.0.1:6379
                 std::env::remove_var("STEWARD_CONFIG_PATH");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn load_initial_rate_limits_succeeds_immediately_for_valid_source() {
+        let temp_dir = std::env::temp_dir();
+        let file_path = temp_dir.join(format!(
+            "steward_initial_load_valid_{}.json",
+            std::process::id()
+        ));
+        let content = r#"{
+            "domain": "test_domain",
+            "descriptors": [
+                {
+                    "key": "test_key",
+                    "value": "test_val",
+                    "rate_limit": {
+                        "unit": "seconds",
+                        "requests_per_unit": 10
+                    }
+                }
+            ]
+        }"#;
+        std::fs::write(&file_path, content).unwrap();
+
+        let source = super::ConfigSource::File(file_path.to_str().unwrap().to_string());
+        let config = super::load_initial_rate_limits(&source, Duration::from_secs(5))
+            .await
+            .expect("should load initial config");
+
+        assert_eq!(config.len(), 1);
+        assert!(config.get("test_domain").is_some());
+        let _ = std::fs::remove_file(&file_path);
+    }
+
+    #[tokio::test]
+    async fn load_initial_rate_limits_zero_budget_fails_immediately() {
+        let source = super::ConfigSource::File("/non/existent/path/for/test.json".to_string());
+        let start = std::time::Instant::now();
+        let result = super::load_initial_rate_limits(&source, Duration::ZERO).await;
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err());
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "zero budget should fail immediately"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_initial_rate_limits_times_out_and_reports_attempts() {
+        let source = super::ConfigSource::File("/non/existent/path/for/test.json".to_string());
+        let start = std::time::Instant::now();
+        let result = super::load_initial_rate_limits(&source, Duration::from_millis(600)).await;
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err();
+        assert!(
+            err_msg.contains("initial configuration load failed after"),
+            "error message should indicate timeout: {err_msg}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(500),
+            "should have waited for budget to expire"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_initial_rate_limits_retries_and_succeeds_when_source_appears() {
+        let temp_dir = std::env::temp_dir();
+        let file_path = temp_dir.join(format!(
+            "steward_initial_load_delayed_{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&file_path);
+
+        let path_clone = file_path.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let content = r#"{
+                "domain": "delayed_domain",
+                "descriptors": [
+                    {
+                        "key": "delayed_key",
+                        "value": "1",
+                        "rate_limit": {
+                            "unit": "minute",
+                            "requests_per_unit": 20
+                        }
+                    }
+                ]
+            }"#;
+            let _ = std::fs::write(&path_clone, content);
+        });
+
+        let source = super::ConfigSource::File(file_path.to_str().unwrap().to_string());
+        let config = super::load_initial_rate_limits(&source, Duration::from_secs(3))
+            .await
+            .expect("should eventually load config after delay");
+
+        assert_eq!(config.len(), 1);
+        assert!(config.get("delayed_domain").is_some());
+        let _ = std::fs::remove_file(&file_path);
     }
 }

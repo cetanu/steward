@@ -7,17 +7,20 @@ services:
       - ./containers/steward.yaml:/project/steward.yaml:ro
     ports:
       - 5001:5001
-    links:
-      - redis
-      - mock_config
+    depends_on:
+      redis:
+        condition: service_started
+      mock_config:
+        condition: service_healthy
+    restart: on-failure
     environment:
       RUST_LOG: steward=INFO
     healthcheck:
       test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/5001' || exit 1"]
-      interval: 5s
-      timeout: 3s
-      retries: 3
-      start_period: 3s
+      interval: 1s
+      timeout: 2s
+      retries: 10
+      start_period: 1s
 
   server-replica-2:
     build:
@@ -27,26 +30,32 @@ services:
       - ./containers/steward.yaml:/project/steward.yaml:ro
     ports:
       - 5002:5001
-    links:
-      - redis
-      - mock_config
+    depends_on:
+      redis:
+        condition: service_started
+      mock_config:
+        condition: service_healthy
+    restart: on-failure
     environment:
       RUST_LOG: steward=INFO
     healthcheck:
       test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/5001' || exit 1"]
-      interval: 5s
-      timeout: 3s
-      retries: 3
-      start_period: 3s
+      interval: 1s
+      timeout: 2s
+      retries: 10
+      start_period: 1s
 
   envoy:
     build:
       context: containers
       dockerfile: envoy.Dockerfile
-    links:
-      - server
-      - server-replica-2
-      - httpbin
+    depends_on:
+      server:
+        condition: service_healthy
+      server-replica-2:
+        condition: service_healthy
+      httpbin:
+        condition: service_started
     ports:
       - "127.0.0.1:9901:9901"
       - 8080:8080
@@ -74,3 +83,9 @@ services:
       - 8000:8000
     expose:
       - 8000
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/rate_limits')"]
+      interval: 1s
+      timeout: 2s
+      retries: 10
+      start_period: 1s
