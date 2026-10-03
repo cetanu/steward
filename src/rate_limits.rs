@@ -136,8 +136,28 @@ impl Unit {
 }
 
 impl RateLimit {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.requests_per_unit <= 0 {
+            return Err(format!(
+                "invalid requests_per_unit ({}): must be greater than 0",
+                self.requests_per_unit
+            ));
+        }
+        if self.requests_per_unit > u32::MAX as i64 {
+            return Err(format!(
+                "oversized requests_per_unit ({}): exceeds maximum capacity of {}",
+                self.requests_per_unit,
+                u32::MAX
+            ));
+        }
+        if self.unit == Unit::Unknown || self.unit.seconds().is_none() {
+            return Err(format!("invalid rate limit unit: {:?}", self.unit));
+        }
+        Ok(())
+    }
+
     pub fn is_valid(&self) -> bool {
-        self.requests_per_unit > 0 && self.unit.duration().is_some()
+        self.validate().is_ok()
     }
 
     pub fn with_override(&self, override_: &RateLimitOverride) -> Self {

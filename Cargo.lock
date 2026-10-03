@@ -1825,6 +1825,7 @@ dependencies = [
  "r2d2",
  "redis",
  "reqwest",
+ "ring",
  "serde",
  "serde_json",
  "socket2",

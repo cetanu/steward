@@ -1,6 +1,8 @@
 use std::{
-    collections::HashMap,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -14,10 +16,12 @@ use crate::metrics::{SharedMetrics, count, gauge, time};
 use crate::proto::envoy::service::ratelimit::v3::rate_limit_response::{Code, DescriptorStatus};
 use crate::proto::envoy::service::ratelimit::v3::rate_limit_service_server::RateLimitService;
 use crate::proto::envoy::service::ratelimit::v3::{RateLimitRequest, RateLimitResponse};
-use crate::rate_limits::{Algorithm, PolicyTrie, RateLimit, encode_canonical_path, rate_limit_key};
+use crate::rate_limits::{Algorithm, RateLimit, encode_canonical_path, rate_limit_key};
 use crate::response::{build_response, limit_response};
 
-pub type RateLimitConfigs = HashMap<String, PolicyTrie>;
+pub use crate::config_source::CompiledConfig;
+
+pub type RateLimitConfigs = Arc<CompiledConfig>;
 
 const FIXED_WINDOW_SCRIPT: &str = include_str!("scripts/fixed_window.lua");
 const TOKEN_BUCKET_SCRIPT: &str = include_str!("scripts/token_bucket.lua");
@@ -86,6 +90,32 @@ impl Steward {
             default_ttl,
             metrics,
         })
+    }
+
+    pub fn active_config(&self) -> Arc<CompiledConfig> {
+        Arc::clone(&*self.config_rx.borrow())
+    }
+
+    pub fn active_version_hash(&self) -> String {
+        self.config_rx.borrow().version_hash.clone()
+    }
+
+    pub fn config_age_seconds(&self) -> u64 {
+        self.config_rx.borrow().age_seconds()
+    }
+
+    #[cfg(test)]
+    pub fn for_test(config_rx: Receiver<RateLimitConfigs>) -> Self {
+        let manager = redis::Client::open("redis://127.0.0.1:6379").unwrap();
+        let redis_pool = r2d2::Pool::builder()
+            .min_idle(Some(0))
+            .build_unchecked(manager);
+        Self {
+            config_rx,
+            redis_pool,
+            default_ttl: 10,
+            metrics: Arc::new(StatsdClient::from_sink("", NopMetricSink)),
+        }
     }
 
     fn check_limit(&self, key: &str, limit: &RateLimit, hits: i64) -> redis::RedisResult<Decision> {
@@ -358,6 +388,7 @@ impl RateLimitService for Steward {
         debug!(
             domain = %request.domain,
             descriptors = request.descriptors.len(),
+            version_hash = %self.config_rx.borrow().version_hash,
             "evaluating rate limits"
         );
 
@@ -586,5 +617,29 @@ mod tests {
         let reset = duration_until_reset_for(&limit, 10);
         assert!(reset > 0);
         assert!(reset <= 60);
+    }
+
+    #[test]
+    fn steward_exposes_active_version_hash_and_age() {
+        let json_str = r#"{
+            "domain": "default",
+            "descriptors": [
+                {
+                    "key": "k",
+                    "value": "v",
+                    "rate_limit": { "unit": "seconds", "requests_per_unit": 10 }
+                }
+            ]
+        }"#;
+        let raw: crate::config_source::RawRateLimitsConfig =
+            serde_json::from_str(json_str).unwrap();
+        let compiled = crate::config_source::compile_rate_limits(raw).unwrap();
+        let expected_hash = compiled.version_hash.clone();
+        let (_tx, rx) = tokio::sync::watch::channel(compiled);
+
+        let steward = super::Steward::for_test(rx);
+        assert_eq!(steward.active_version_hash(), expected_hash);
+        assert_eq!(steward.active_config().version_hash, expected_hash);
+        let _ = steward.config_age_seconds();
     }
 }
