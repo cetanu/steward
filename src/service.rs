@@ -1870,10 +1870,7 @@ mod tests {
         }
     }
 
-    fn spawn_dedicated_ephemeral_redis() -> Option<(u16, std::process::Child)> {
-        static DEDICATED_PORT: std::sync::atomic::AtomicU16 =
-            std::sync::atomic::AtomicU16::new(17500);
-        let port = DEDICATED_PORT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    fn spawn_dedicated_ephemeral_redis_on_port(port: u16) -> Option<std::process::Child> {
         let child = std::process::Command::new("redis-server")
             .arg("--port")
             .arg(port.to_string())
@@ -1888,6 +1885,14 @@ mod tests {
             .spawn()
             .ok()?;
         std::thread::sleep(std::time::Duration::from_millis(250));
+        Some(child)
+    }
+
+    fn spawn_dedicated_ephemeral_redis() -> Option<(u16, std::process::Child)> {
+        static DEDICATED_PORT: std::sync::atomic::AtomicU16 =
+            std::sync::atomic::AtomicU16::new(17500);
+        let port = DEDICATED_PORT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let child = spawn_dedicated_ephemeral_redis_on_port(port)?;
         Some((port, child))
     }
 
@@ -3628,6 +3633,113 @@ mod tests {
             "backend failure when Redis is killed must return Unavailable for Envoy failure_mode_deny handling"
         );
         assert_eq!(err.message(), "rate limit storage backend is unavailable");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_redis_failover_and_reconnection_resumes_cleanly() {
+        use crate::proto::envoy::extensions::common::ratelimit::v3::{
+            RateLimitDescriptor, rate_limit_descriptor::Entry,
+        };
+        use crate::proto::envoy::service::ratelimit::v3::RateLimitRequest;
+        use crate::proto::envoy::service::ratelimit::v3::rate_limit_service_server::RateLimitService;
+
+        let Some((port, mut child)) = spawn_dedicated_ephemeral_redis() else {
+            eprintln!("Skipping test: redis-server command not available");
+            return;
+        };
+
+        let client = redis::Client::open(format!("redis://127.0.0.1:{port}")).unwrap();
+        let mut config = redis::aio::ConnectionManagerConfig::new();
+        config = config.set_connection_timeout(Some(std::time::Duration::from_millis(200)));
+        config = config.set_response_timeout(Some(std::time::Duration::from_millis(200)));
+        config = config.set_number_of_retries(2);
+        let redis = redis::aio::ConnectionManager::new_with_config(client, config)
+            .await
+            .unwrap();
+
+        let domain = "domain_reconnect_test";
+        let config_json = format!(
+            r#"{{
+            "domain": "{domain}",
+            "descriptors": [
+                {{
+                    "key": "action",
+                    "value": "checkout",
+                    "rate_limit": {{ "algorithm": "fixed_window", "unit": "seconds", "requests_per_unit": 100 }}
+                }}
+            ]
+        }}"#
+        );
+
+        let raw: crate::config_source::RawRateLimitsConfig =
+            serde_json::from_str(&config_json).unwrap();
+        let compiled = crate::config_source::compile_rate_limits(raw).unwrap();
+        let (_tx, rx) = tokio::sync::watch::channel(compiled);
+        let steward = super::Steward {
+            config_rx: rx,
+            redis,
+            default_ttl: 10,
+            metrics: std::sync::Arc::new(cadence::StatsdClient::from_sink(
+                "",
+                cadence::NopMetricSink,
+            )),
+            scripts: super::StewardScripts::default(),
+            execution_timeout: super::DEFAULT_EXECUTION_TIMEOUT,
+            admission_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                super::DEFAULT_MAX_CONCURRENT_REQUESTS,
+            )),
+            in_flight: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+
+        let make_req = || RateLimitRequest {
+            domain: domain.to_string(),
+            descriptors: vec![RateLimitDescriptor {
+                entries: vec![Entry {
+                    key: "action".to_string(),
+                    value: "checkout".to_string(),
+                }],
+                limit: None,
+                hits_addend: Some(1),
+                is_negative_hits: false,
+            }],
+            hits_addend: 0,
+        };
+
+        // Phase 1: Request succeeds on initial healthy primary
+        let r1 = steward
+            .should_rate_limit(tonic::Request::new(make_req()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(r1.overall_code, Code::Ok as i32);
+
+        // Phase 2: Kill primary Redis process (simulating outage or crash)
+        let _ = child.kill();
+        let _ = child.wait();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let err = steward
+            .should_rate_limit(tonic::Request::new(make_req()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+
+        // Phase 3: Simulate failover by starting a new Redis instance on the same target endpoint/port
+        let mut new_child = spawn_dedicated_ephemeral_redis_on_port(port).unwrap();
+
+        // Allow ConnectionManager to re-establish connection
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // Phase 4: Request immediately resumes succeeding with zero restart needed
+        let r2 = steward
+            .should_rate_limit(tonic::Request::new(make_req()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(r2.overall_code, Code::Ok as i32);
+
+        let _ = new_child.kill();
+        let _ = new_child.wait();
     }
 
     #[test]
