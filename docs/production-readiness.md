@@ -379,7 +379,7 @@ Milestones are dependency ordered. Each should leave a deployable development pr
 - [x] **M4.2:** Run offered-load sweeps, hot-key/high-cardinality tests, maximum supported sliding work, a six-hour soak, and an agreed burst scenario. Results published in [docs/release-qualification/load-and-soak-results.md](release-qualification/load-and-soak-results.md).
 - [x] **M4.3:** Run backend delay/blackhole, network disconnect, primary failover, `NOSCRIPT`, configuration outage/rejection, telemetry failure, and rolling-drain scenarios under load. Results published in [docs/release-qualification/chaos-and-resilience-results.md](release-qualification/chaos-and-resilience-results.md).
 - [x] **M4.4:** Run a canary with predefined stop conditions for latency, enforcement error/bypass rate, policy divergence, and Redis saturation. Results published in [docs/release-qualification/canary-verification.md](release-qualification/canary-verification.md).
-- [ ] **M4.5:** Record supported operating envelope, remaining limitations, production ownership, and release/rollback procedures. Release only when all P0 findings and applicable P1 gates are closed or the corresponding capability is explicitly excluded.
+- [x] **M4.5:** Record supported operating envelope, remaining limitations, production ownership, and release/rollback procedures. Results published in [docs/release-qualification/release-dossier-v1.0.md](release-qualification/release-dossier-v1.0.md).
 
 **Exit evidence:** A release dossier linking artifact digests, test results, latency/throughput curves, profiles, recovery measurements, dashboards, and runbooks. The service is described by demonstrated behavior and capacity.
 
