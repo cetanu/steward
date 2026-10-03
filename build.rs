@@ -75,7 +75,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Compile protocol buffers
     tonic_prost_build::configure()
-        .build_client(false)
+        .build_client(true)
+        .build_server(true)
         .disable_comments(["."])
         .boxed(".envoy.config.core.v3.AsyncDataSource.specifier.remote")
         .compile_protos(&["envoy/service/ratelimit/v3/rls.proto"], &["."])?;

@@ -357,7 +357,7 @@ Milestones are dependency ordered. Each should leave a deployable development pr
 - [x] **M2.4:** Certify token and sliding reference models, boundaries, weighted costs/refunds within supported scope, concurrency, clock regression, expiry, capacity edits, and two-replica behavior. Include Redis cardinality/state assertions.
 - [x] **M2.5:** Evaluate bounded concurrent calls or pipelining for multiple rules; implement and test script-cache recovery for the chosen path. Profile matching allocations and snapshot cloning before adding further data structures.
 - [x] **M2.6:** Instrument end-to-end latency, backend phases, outcomes, admission, and in-flight work. Remove routine INFO/WARN decision logging from the high-volume path and guard telemetry error reporting.
-- [ ] **M2.7:** Build a reproducible load harness and publish baseline/updated results for all advertised algorithms, descriptor counts, key skews, and hit costs. Publish saturation, supported load, and service/Redis profiles.
+- [x] **M2.7:** Build a reproducible load harness and publish baseline/updated results for all advertised algorithms, descriptor counts, key skews, and hit costs. Publish saturation, supported load, and service/Redis profiles.
 
 **Exit evidence:** P0 algorithm/resource gaps are closed. Each production-enabled algorithm has a tested behavioral contract and declared capacity. Slow Redis and excess offered load cannot create unbounded work.
 
