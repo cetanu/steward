@@ -69,24 +69,36 @@ Common Redis culprits:
 
 ### Step 3: Check Steward Fleet CPU and In-Flight Permits
 ```bash
-# Check Kubernetes pod CPU / memory
+# On Kubernetes:
 kubectl top pods -l app=steward -n steward-system
+
+# On systemd / bare metal host:
+systemctl status steward
+top -b -n 1 -p $(pgrep steward)
+
+# In Docker container:
+docker stats --no-stream steward-server
 ```
-- If pods exceed 70% CPU, horizontal pod autoscaling (HPA) may be lagging behind an unexpected offered-load spike.
+- If instances exceed 70% CPU, auto-scaling or instance provisioning may be lagging behind an unexpected offered-load spike.
 
 ---
 
 ## 4. Root Causes & Actionable Mitigations
 
 ### Scenario A: In-Flight Semaphore Exhaustion (Admission Load Shedding)
-**Cause:** More than 1,024 requests are concurrently executing against a single Steward pod. This happens during high traffic spikes or when Redis slowdown backs up in-flight requests.
+**Cause:** More than 1,024 requests are concurrently executing against a single Steward instance. This happens during high traffic spikes or when Redis slowdown backs up in-flight requests.
 **Actions:**
 1. **Scale Steward Replicas Immediately:**
    ```bash
+   # Kubernetes:
    kubectl scale deployment steward --replicas=<current_replicas * 2> -n steward-system
+
+   # Systemd / Bare Metal / Nomad / ECS:
+   # Start additional systemd template instances (e.g. systemctl start steward@{2..4})
+   # or increase task count in your supervisor/orchestrator (Nomad count, ECS desired count).
    ```
 2. **Verify Envoy Load Balancing:**
-   Check that traffic is distributing evenly across all backend pods rather than pinning to a single pod over persistent HTTP/2 connections.
+   Check that traffic is distributing evenly across all backend instances rather than pinning to a single replica over persistent HTTP/2 connections.
 
 ### Scenario B: Redis CPU Saturation or Slow Commands
 **Cause:** Heavy sliding-window evaluation or single-key hot-spotting consuming Redis single-threaded execution capacity.

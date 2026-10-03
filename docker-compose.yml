@@ -3,6 +3,8 @@ services:
     build:
       context: .
       dockerfile: containers/Dockerfile
+    volumes:
+      - ./containers/steward.yaml:/project/steward.yaml:ro
     ports:
       - 5001:5001
     links:
@@ -21,6 +23,8 @@ services:
     build:
       context: .
       dockerfile: containers/Dockerfile
+    volumes:
+      - ./containers/steward.yaml:/project/steward.yaml:ro
     ports:
       - 5002:5001
     links:

@@ -35,39 +35,69 @@ Simply execute `cargo build --release` to create a binary
 which, when run, will start the rate limit service as a
 gRPC server.
 
-### Running the environment
+### Local development environment
 
-The environment can be brought up with `make run`.  
-It includes an envoy proxy, the rate limit service, a redis
-database, a mock configuration server, and a httpbin backend.
+A complete local testbed can be brought up with `make run`.  
+This starts an Envoy proxy, a Redis database, a mock configuration server,
+and an httpbin backend for integration testing and verification within this repository.
+
+> **Note:** In production, Steward is deployed as a standalone binary or container image
+> directly into your own infrastructure (Kubernetes, ECS, Nomad, or bare-metal host).
+> The mock server, Docker Compose setup, and testbed configs are strictly development harnesses.
 
 ### Running tests
 
-The project uses Rust HTTP integration tests against the Docker Compose
-environment. Run them with `make test`. Rust unit tests run with `cargo test`.
+The project includes unit tests, component benchmarks, and end-to-end integration tests:
+* `cargo test` - Runs Rust unit and component tests.
+* `make test` - Runs end-to-end integration tests against the local Docker Compose harness.
 
 
 Configuration
 ------------------------------------------------------------
 
-The path to local configuration can be specified using the
-environment variable `STEWARD_CONFIG_PATH`.  
-The default location is `steward.yaml` in the current working
-directory.
+Steward resolves its configuration using the following precedence:
+1. `STEWARD_CONFIG_PATH` environment variable (explicit file path or comma-separated list).
+2. `./steward.yaml` or `./steward.yml` (current working directory).
+3. `/etc/steward/steward.yaml` or `/etc/steward/steward.yml` (standard daemon path).
+4. `/etc/steward.yaml` or `/etc/steward.yml` (standard system root path).
+5. Environment variables (`STEWARD__*` and `REDIS_URL`), enabling fully file-less 12-factor deployments.
 
-Example configuration file:
+### Example configuration file
 
 ```yaml
 listen:
   addr: 0.0.0.0
   port: 5001
+
 rate_limit_configs:
-  http: http://mock_config:8000/api/rate_limits
-redis_host: redis
-redis_connections: 8
-default_ttl: 10
+  # Upstream HTTP endpoint:
+  http: https://config-service.internal/v1/rate_limits
+  # Or local file:
+  # file: /etc/steward/rate_limits.json
+
+# Redis connection target (supports redis:// and rediss:// for TLS):
+redis_url: redis://127.0.0.1:6379
+
 config_refresh_interval_secs: 60
+max_stale_duration_secs: 3600
+execution_timeout_ms: 10
+max_concurrent_requests: 1024
 ```
+
+### Environment variables (12-Factor)
+
+All configuration options can be configured via environment variables, with no configuration file required:
+
+* `STEWARD_CONFIG_PATH`: Path to configuration file(s).
+* `REDIS_URL`: Redis counter store URL (`redis://...` or `rediss://...` for TLS).
+* `STEWARD__LISTEN__ADDR`: Bind IPv4 address (e.g. `0.0.0.0`).
+* `STEWARD__LISTEN__PORT`: Bind port (e.g. `5001`).
+* `STEWARD__RATE_LIMIT_CONFIGS__HTTP`: URL for dynamic rate limit policies.
+* `STEWARD__RATE_LIMIT_CONFIGS__FILE`: Path to local rate limit policy file.
+* `STEWARD__CONFIG_REFRESH_INTERVAL_SECS`: Policy reload polling interval in seconds (default: 60).
+* `STEWARD__MAX_STALE_DURATION_SECS`: Max cache duration before stale policy alert triggers (default: 3600).
+* `STEWARD__EXECUTION_TIMEOUT_MS`: Internal Redis evaluation deadline (default: 10 ms).
+* `STEWARD__MAX_CONCURRENT_REQUESTS`: Max in-flight admission limit before load shedding (default: 1024).
 
 ### `rate_limit_configs`
 

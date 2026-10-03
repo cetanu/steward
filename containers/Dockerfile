@@ -16,7 +16,6 @@ RUN apt-get update \
     && useradd --uid 10001 --gid 10001 --create-home --home-dir /home/steward --shell /usr/sbin/nologin steward
 
 WORKDIR /project
-COPY --chown=10001:10001 containers/steward.yaml steward.yaml
 COPY --chown=10001:10001 --from=builder /project/target/release/steward /project/steward
 
 USER 10001:10001
