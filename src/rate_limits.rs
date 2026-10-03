@@ -179,6 +179,16 @@ impl RateLimit {
     }
 }
 
+pub fn validate_override(override_: &RateLimitOverride) -> Result<(), &'static str> {
+    if override_.requests_per_unit == 0 {
+        return Err("rate limit override requests_per_unit must be greater than 0");
+    }
+    if Unit::from(override_.unit) == Unit::Unknown {
+        return Err("rate limit override unit is invalid or unknown");
+    }
+    Ok(())
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct DescriptorConfig {
     pub key: String,
@@ -711,5 +721,58 @@ mod tests {
         };
         let key_tuned = rate_limit_key("default", "pol_api", &path2, &limit_tuned, 10);
         assert_eq!(key_tb, key_tuned);
+    }
+
+    #[test]
+    fn validate_override_rejects_malformed_inputs() {
+        use super::validate_override;
+        use crate::proto::envoy::extensions::common::ratelimit::v3::rate_limit_descriptor::RateLimitOverride;
+
+        // Zero requests per unit rejected
+        let zero_capacity = RateLimitOverride {
+            requests_per_unit: 0,
+            unit: 1, // Seconds
+        };
+        assert!(validate_override(&zero_capacity).is_err());
+
+        // Unknown unit rejected
+        let unknown_unit = RateLimitOverride {
+            requests_per_unit: 10,
+            unit: 0, // Unknown
+        };
+        assert!(validate_override(&unknown_unit).is_err());
+
+        // Out-of-range unit rejected
+        let invalid_unit = RateLimitOverride {
+            requests_per_unit: 10,
+            unit: 99,
+        };
+        assert!(validate_override(&invalid_unit).is_err());
+
+        // Valid override accepted
+        let valid = RateLimitOverride {
+            requests_per_unit: 50,
+            unit: 1, // Seconds
+        };
+        assert!(validate_override(&valid).is_ok());
+    }
+
+    #[test]
+    fn changing_capacity_threshold_does_not_alter_counter_key_identity() {
+        let base_limit = RateLimit {
+            algorithm: Algorithm::FixedWindow,
+            unit: Unit::Seconds,
+            requests_per_unit: 10,
+        };
+        let path = encode_canonical_path([("service", "payment")]);
+        let key_base = rate_limit_key("default", "policy_1", &path, &base_limit, 10);
+
+        let modified_limit = RateLimit {
+            requests_per_unit: 1000,
+            ..base_limit
+        };
+        let key_modified = rate_limit_key("default", "policy_1", &path, &modified_limit, 10);
+
+        assert_eq!(key_base, key_modified);
     }
 }
