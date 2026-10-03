@@ -17,12 +17,31 @@ services:
       retries: 3
       start_period: 3s
 
+  server-replica-2:
+    build:
+      context: .
+      dockerfile: containers/Dockerfile
+    ports:
+      - 5002:5001
+    links:
+      - redis
+      - mock_config
+    environment:
+      RUST_LOG: steward=INFO
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/5001' || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 3s
+
   envoy:
     build:
       context: containers
       dockerfile: envoy.Dockerfile
     links:
       - server
+      - server-replica-2
       - httpbin
     ports:
       - "127.0.0.1:9901:9901"

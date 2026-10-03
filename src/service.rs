@@ -3742,6 +3742,213 @@ mod tests {
         let _ = new_child.wait();
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_multi_replica_http2_load_balancing_and_timeout() {
+        use crate::proto::envoy::extensions::common::ratelimit::v3::{
+            RateLimitDescriptor, rate_limit_descriptor::Entry,
+        };
+        use crate::proto::envoy::service::ratelimit::v3::{
+            RateLimitRequest, RateLimitResponse,
+            rate_limit_service_client::RateLimitServiceClient,
+            rate_limit_service_server::{RateLimitService, RateLimitServiceServer},
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tonic::transport::{Channel, Endpoint, Server};
+
+        #[derive(Clone)]
+        struct CountingService {
+            steward: super::Steward,
+            counter: std::sync::Arc<AtomicUsize>,
+            delay: Option<std::time::Duration>,
+        }
+
+        #[tonic::async_trait]
+        impl RateLimitService for CountingService {
+            async fn should_rate_limit(
+                &self,
+                request: tonic::Request<RateLimitRequest>,
+            ) -> Result<tonic::Response<RateLimitResponse>, tonic::Status> {
+                self.counter.fetch_add(1, Ordering::SeqCst);
+                if let Some(delay) = self.delay {
+                    tokio::time::sleep(delay).await;
+                }
+                self.steward.should_rate_limit(request).await
+            }
+        }
+
+        let Some((redis_port, mut redis_child)) = spawn_dedicated_ephemeral_redis() else {
+            eprintln!("Skipping test: redis-server not available");
+            return;
+        };
+
+        let domain = "domain_lb_test";
+        let config_json = format!(
+            r#"{{
+            "domain": "{domain}",
+            "descriptors": [
+                {{
+                    "key": "endpoint",
+                    "value": "api",
+                    "rate_limit": {{ "algorithm": "fixed_window", "unit": "seconds", "requests_per_unit": 1000 }}
+                }}
+            ]
+        }}"#
+        );
+        let raw: crate::config_source::RawRateLimitsConfig =
+            serde_json::from_str(&config_json).unwrap();
+        let compiled = crate::config_source::compile_rate_limits(raw).unwrap();
+        let (_tx, rx) = tokio::sync::watch::channel(compiled);
+
+        let make_steward = || async {
+            let client = redis::Client::open(format!("redis://127.0.0.1:{redis_port}")).unwrap();
+            let redis = redis::aio::ConnectionManager::new(client).await.unwrap();
+            super::Steward {
+                config_rx: rx.clone(),
+                redis,
+                default_ttl: 10,
+                metrics: std::sync::Arc::new(cadence::StatsdClient::from_sink(
+                    "",
+                    cadence::NopMetricSink,
+                )),
+                scripts: super::StewardScripts::default(),
+                execution_timeout: super::DEFAULT_EXECUTION_TIMEOUT,
+                admission_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(1024)),
+                in_flight: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            }
+        };
+
+        let s1 = make_steward().await;
+        let s2 = make_steward().await;
+
+        let counter_1 = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter_2 = std::sync::Arc::new(AtomicUsize::new(0));
+
+        let listener_1 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port_1 = listener_1.local_addr().unwrap().port();
+        let incoming_1 = tokio_stream::wrappers::TcpListenerStream::new(listener_1);
+
+        let listener_2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port_2 = listener_2.local_addr().unwrap().port();
+        let incoming_2 = tokio_stream::wrappers::TcpListenerStream::new(listener_2);
+
+        let svc_1 = CountingService {
+            steward: s1,
+            counter: counter_1.clone(),
+            delay: None,
+        };
+        let svc_2 = CountingService {
+            steward: s2,
+            counter: counter_2.clone(),
+            delay: None,
+        };
+
+        let srv_handle_1 = tokio::spawn(async move {
+            let _ = Server::builder()
+                .add_service(RateLimitServiceServer::new(svc_1))
+                .serve_with_incoming(incoming_1)
+                .await;
+        });
+
+        let srv_handle_2 = tokio::spawn(async move {
+            let _ = Server::builder()
+                .add_service(RateLimitServiceServer::new(svc_2))
+                .serve_with_incoming(incoming_2)
+                .await;
+        });
+
+        // Give servers a moment to bind
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // 1. Multi-Replica HTTP/2 Load Balancing Verification
+        let ep1 = Endpoint::from_shared(format!("http://127.0.0.1:{port_1}")).unwrap();
+        let ep2 = Endpoint::from_shared(format!("http://127.0.0.1:{port_2}")).unwrap();
+        let channel = Channel::balance_list(vec![ep1, ep2].into_iter());
+        let mut client = RateLimitServiceClient::new(channel);
+
+        let make_req = || RateLimitRequest {
+            domain: domain.to_string(),
+            descriptors: vec![RateLimitDescriptor {
+                entries: vec![Entry {
+                    key: "endpoint".to_string(),
+                    value: "api".to_string(),
+                }],
+                limit: None,
+                hits_addend: Some(1),
+                is_negative_hits: false,
+            }],
+            hits_addend: 0,
+        };
+
+        for _ in 0..60 {
+            let resp = client
+                .should_rate_limit(tonic::Request::new(make_req()))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(resp.overall_code, Code::Ok as i32);
+        }
+
+        let hits_1 = counter_1.load(Ordering::SeqCst);
+        let hits_2 = counter_2.load(Ordering::SeqCst);
+        assert_eq!(hits_1 + hits_2, 60, "total requests must equal 60");
+        assert!(
+            hits_1 >= 20 && hits_2 >= 20,
+            "requests must distribute evenly across replicas under HTTP/2: hits_1={hits_1}, hits_2={hits_2}"
+        );
+
+        // 2. Client RPC Timeout Enforcement (matching Envoy 20ms timeout)
+        let listener_slow = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port_slow = listener_slow.local_addr().unwrap().port();
+        let incoming_slow = tokio_stream::wrappers::TcpListenerStream::new(listener_slow);
+        let s_slow = make_steward().await;
+        let counter_slow = std::sync::Arc::new(AtomicUsize::new(0));
+        let svc_slow = CountingService {
+            steward: s_slow,
+            counter: counter_slow,
+            delay: Some(std::time::Duration::from_millis(150)), // Stalled check > 20ms
+        };
+        let srv_handle_slow = tokio::spawn(async move {
+            let _ = Server::builder()
+                .add_service(RateLimitServiceServer::new(svc_slow))
+                .serve_with_incoming(incoming_slow)
+                .await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let ep_slow = Endpoint::from_shared(format!("http://127.0.0.1:{port_slow}"))
+            .unwrap()
+            .timeout(std::time::Duration::from_millis(20)); // Envoy 20ms timeout
+        let channel_slow = ep_slow.connect().await.unwrap();
+        let mut timed_client = RateLimitServiceClient::new(channel_slow);
+
+        let start = std::time::Instant::now();
+        let timeout_res = timed_client
+            .should_rate_limit(tonic::Request::new(make_req()))
+            .await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            timeout_res.is_err(),
+            "stalled check must be aborted by client timeout"
+        );
+        let err = timeout_res.unwrap_err();
+        assert!(
+            err.code() == tonic::Code::Cancelled || err.code() == tonic::Code::DeadlineExceeded,
+            "timed out request must return Cancelled or DeadlineExceeded, got: {:?}",
+            err.code()
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(100),
+            "timeout must trigger around 20ms, elapsed was: {elapsed:?}"
+        );
+
+        srv_handle_1.abort();
+        srv_handle_2.abort();
+        srv_handle_slow.abort();
+        let _ = redis_child.kill();
+        let _ = redis_child.wait();
+    }
+
     #[test]
     fn test_parse_grpc_timeout() {
         assert_eq!(
