@@ -365,7 +365,7 @@ Milestones are dependency ordered. Each should leave a deployable development pr
 
 - [x] **M3.1:** Produce a non-root multi-stage release image, pin deploy/test artifacts and compiler identities, qualify the release image in CI, and add dependency/image scans plus an SBOM.
 - [x] **M3.2:** Establish authenticated Envoy-to-service traffic, Redis TLS/credentials, secure configuration access, private admin/backend ports, and secret rotation behavior. Replace `redis_host` with one validated complete URL.
-- [ ] **M3.3:** Implement health/readiness and bounded SIGTERM drain; supervise configuration and telemetry tasks. Add deployment startup/readiness/liveness probes and termination settings.
+- [x] **M3.3:** Implement health/readiness and bounded SIGTERM drain; supervise configuration and telemetry tasks. Add deployment startup/readiness/liveness probes and termination settings.
 - [ ] **M3.4:** Reuse/bound the configuration client, add refresh jitter and loader-health metrics, and document stale-policy/version-divergence behavior. Add conditional HTTP refresh if the chosen source supports it.
 - [ ] **M3.5:** Declare managed Redis HA, memory/eviction/persistence policy, capacity headroom, supported failover behavior, and quota-state loss. Run restart/failover/cache-loss/memory-pressure exercises.
 - [ ] **M3.6:** Provide the deployment's explicit Envoy timeout/failure policy and cluster connection/request circuit breakers; verify traffic distribution across multiple RLS replicas under persistent HTTP/2 connections.

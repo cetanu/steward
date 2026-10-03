@@ -6070,4 +6070,109 @@ mod tests {
         // 6. Empty target errors
         assert!(normalize_redis_url("   ").is_err());
     }
+
+    #[tokio::test]
+    async fn test_grpc_health_service_lifecycle_and_shutdown_drain() {
+        use crate::proto::envoy::service::ratelimit::v3::rate_limit_service_server::RateLimitServiceServer;
+        use tonic::transport::Server;
+        use tonic_health::pb::HealthCheckRequest;
+        use tonic_health::pb::health_check_response::ServingStatus;
+        use tonic_health::pb::health_client::HealthClient;
+
+        let json_str = r#"{"domain": "default", "descriptors": [{"key": "k", "rate_limit": {"unit": "seconds", "requests_per_unit": 10}}]}"#;
+        let raw: crate::config_source::RawRateLimitsConfig =
+            serde_json::from_str(json_str).unwrap();
+        let compiled = crate::config_source::compile_rate_limits(raw).unwrap();
+        let (_tx, rx_conf) = tokio::sync::watch::channel(compiled);
+        let steward = super::Steward::for_test(rx_conf).await;
+
+        let (health_reporter, health_service) = tonic_health::server::health_reporter();
+        health_reporter
+            .set_serving::<RateLimitServiceServer<super::Steward>>()
+            .await;
+        health_reporter
+            .set_service_status("", tonic_health::ServingStatus::Serving)
+            .await;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = listener.local_addr().unwrap();
+        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let server_handle = tokio::spawn(async move {
+            Server::builder()
+                .add_service(health_service)
+                .add_service(RateLimitServiceServer::new(steward))
+                .serve_with_incoming_shutdown(incoming, async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+        });
+
+        let channel = tonic::transport::Channel::from_shared(format!("http://{local_addr}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+
+        let mut health_client = HealthClient::new(channel);
+
+        // 1. Initial status for overall service ("") is SERVING
+        let resp_overall = health_client
+            .check(HealthCheckRequest {
+                service: "".to_string(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp_overall.status, ServingStatus::Serving as i32);
+
+        // 2. Initial status for RateLimitService is SERVING
+        let rls_service_name = "envoy.service.ratelimit.v3.RateLimitService";
+        let resp_rls = health_client
+            .check(HealthCheckRequest {
+                service: rls_service_name.to_string(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp_rls.status, ServingStatus::Serving as i32);
+
+        // 3. Status for unknown service is NotFound error
+        let err_unknown = health_client
+            .check(HealthCheckRequest {
+                service: "unknown.service.Name".to_string(),
+            })
+            .await;
+        assert!(err_unknown.is_err());
+        assert_eq!(err_unknown.unwrap_err().code(), tonic::Code::NotFound);
+
+        // 4. Mark NOT_SERVING (simulating SIGTERM initiation)
+        health_reporter
+            .set_not_serving::<RateLimitServiceServer<super::Steward>>()
+            .await;
+        health_reporter
+            .set_service_status("", tonic_health::ServingStatus::NotServing)
+            .await;
+
+        let resp_not_serving = health_client
+            .check(HealthCheckRequest {
+                service: rls_service_name.to_string(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp_not_serving.status, ServingStatus::NotServing as i32);
+
+        // 5. Trigger graceful shutdown and await termination
+        let _ = shutdown_tx.send(());
+        let server_res =
+            tokio::time::timeout(std::time::Duration::from_secs(3), server_handle).await;
+        assert!(
+            server_res.is_ok(),
+            "server must terminate within shutdown timeout"
+        );
+    }
 }

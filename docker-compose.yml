@@ -10,6 +10,12 @@ services:
       - mock_config
     environment:
       RUST_LOG: steward=INFO
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/5001' || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 3s
 
   envoy:
     build:
