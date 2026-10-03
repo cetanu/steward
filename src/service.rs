@@ -3,7 +3,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use cadence::{NopMetricSink, StatsdClient};
@@ -23,6 +23,35 @@ use crate::response::build_response;
 pub use crate::config_source::CompiledConfig;
 
 pub type RateLimitConfigs = Arc<CompiledConfig>;
+
+pub const DEFAULT_EXECUTION_TIMEOUT: Duration = Duration::from_millis(10);
+pub const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 1024;
+
+/// Parse the standard gRPC timeout header (`grpc-timeout` from `request.metadata()`).
+/// Standard gRPC timeouts use format `<value><unit>` where unit is `H` (hours),
+/// `M` (minutes), `S` (seconds), `m` (milliseconds), `u` (microseconds), or `n` (nanoseconds).
+pub fn parse_grpc_timeout(val: &str) -> Option<Duration> {
+    let val = val.trim();
+    if val.is_empty() {
+        return None;
+    }
+    let mut chars = val.char_indices();
+    let (last_idx, last_char) = chars.next_back()?;
+    let num_part = &val[..last_idx];
+    if num_part.is_empty() {
+        return None;
+    }
+    let num: u64 = num_part.parse().ok()?;
+    match last_char {
+        'H' => num.checked_mul(3600).map(Duration::from_secs),
+        'M' => num.checked_mul(60).map(Duration::from_secs),
+        'S' => Some(Duration::from_secs(num)),
+        'm' => Some(Duration::from_millis(num)),
+        'u' => Some(Duration::from_micros(num)),
+        'n' => Some(Duration::from_nanos(num)),
+        _ => None,
+    }
+}
 
 const FIXED_WINDOW_SCRIPT: &str = include_str!("scripts/fixed_window.lua");
 const FIXED_WINDOW_REFUND_SCRIPT: &str = include_str!("scripts/fixed_window_refund.lua");
@@ -83,6 +112,8 @@ pub struct Steward {
     default_ttl: usize,
     metrics: SharedMetrics,
     scripts: StewardScripts,
+    pub execution_timeout: Duration,
+    pub admission_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl Steward {
@@ -121,7 +152,41 @@ impl Steward {
             default_ttl,
             metrics,
             scripts: StewardScripts::default(),
+            execution_timeout: DEFAULT_EXECUTION_TIMEOUT,
+            admission_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                DEFAULT_MAX_CONCURRENT_REQUESTS,
+            )),
         })
+    }
+
+    pub fn with_execution_timeout(mut self, timeout: Duration) -> Self {
+        self.execution_timeout = timeout;
+        self
+    }
+
+    pub fn with_max_concurrent_requests(mut self, max_concurrent_requests: usize) -> Self {
+        self.admission_semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent_requests));
+        self
+    }
+
+    pub fn with_admission_semaphore(mut self, semaphore: Arc<tokio::sync::Semaphore>) -> Self {
+        self.admission_semaphore = semaphore;
+        self
+    }
+
+    /// Calculate the effective execution timeout given an optional client timeout.
+    /// If client deadline is present, `min(client_timeout.saturating_sub(2ms).max(1ms), self.execution_timeout)`;
+    /// if not present, use `self.execution_timeout`.
+    pub fn effective_timeout(&self, client_timeout: Option<Duration>) -> Duration {
+        match client_timeout {
+            Some(client_timeout) => {
+                let reserve = Duration::from_millis(2);
+                let min_timeout = Duration::from_millis(1);
+                let client_budget = client_timeout.saturating_sub(reserve).max(min_timeout);
+                std::cmp::min(client_budget, self.execution_timeout)
+            }
+            None => self.execution_timeout,
+        }
     }
 
     pub fn active_config(&self) -> Arc<CompiledConfig> {
@@ -153,6 +218,10 @@ impl Steward {
             default_ttl: 10,
             metrics: Arc::new(StatsdClient::from_sink("", NopMetricSink)),
             scripts: StewardScripts::default(),
+            execution_timeout: DEFAULT_EXECUTION_TIMEOUT,
+            admission_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                DEFAULT_MAX_CONCURRENT_REQUESTS,
+            )),
         }
     }
 
@@ -592,6 +661,21 @@ impl RateLimitService for Steward {
         request: tonic::Request<RateLimitRequest>,
     ) -> Result<Response<RateLimitResponse>, tonic::Status> {
         count(&self.metrics, "requests.total", 1);
+
+        // Global Admission Control (Load Shedding): Immediate non-blocking permit acquisition
+        let _permit = match self.admission_semaphore.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(tokio::sync::TryAcquireError::NoPermits) => {
+                count(&self.metrics, "requests.rejected_admission", 1);
+                return Err(tonic::Status::resource_exhausted(
+                    "admission limit reached; request rejected due to load shedding",
+                ));
+            }
+            Err(tokio::sync::TryAcquireError::Closed) => {
+                return Err(tonic::Status::unavailable("service is shutting down"));
+            }
+        };
+
         let (metadata, _, request) = request.into_parts();
 
         // 1. Request Dimension & Override Validation
@@ -706,84 +790,108 @@ impl RateLimitService for Steward {
             "evaluating rate limits"
         );
 
-        // 4. Redis Evaluation Phase (preserving 1:1 input descriptor order)
+        // Effective timeout calculation from gRPC deadline header
+        let client_timeout = metadata
+            .get("grpc-timeout")
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_grpc_timeout);
+        let effective_timeout = self.effective_timeout(client_timeout);
+
+        // 4. Redis Evaluation Phase (wrapped in bounded timeout, preserving 1:1 input descriptor order)
         let default_ttl = self.default_ttl;
-        let mut statuses = Vec::with_capacity(evaluations.len());
-        let mut any_rule_over_limit = false;
-        let mut first_redis_error = None;
+        let eval_result = tokio::time::timeout(effective_timeout, async {
+            let mut statuses = Vec::with_capacity(evaluations.len());
+            let mut any_rule_over_limit = false;
+            let mut first_redis_error = None;
 
-        for eval in evaluations {
-            match eval {
-                DescriptorEvaluation::Unmatched => {
-                    count(&self.metrics, "descriptors.unmatched", 1);
-                    statuses.push(DescriptorStatus {
-                        code: Code::Ok as i32,
-                        current_limit: None,
-                        limit_remaining: 0,
-                        duration_until_reset: None,
-                        quota: None,
-                    });
-                }
-                DescriptorEvaluation::Matched(desc_match) => {
-                    let mut successful_decisions =
-                        Vec::with_capacity(desc_match.limits_to_check.len());
-                    let mut failed_rules = Vec::new();
-
-                    for (key, limit) in &desc_match.limits_to_check {
-                        let result = self
-                            .execute_check_limit(key, limit, desc_match.operation)
-                            .await;
-                        match result {
-                            Ok(decision) => {
-                                if !decision.allowed {
-                                    any_rule_over_limit = true;
-                                }
-                                successful_decisions.push((limit, decision));
-                            }
-                            Err(error) => {
-                                if first_redis_error.is_none() {
-                                    first_redis_error = Some(error.clone());
-                                }
-                                failed_rules.push((limit, error));
-                            }
-                        }
-                    }
-
-                    let has_over_limit = successful_decisions.iter().any(|(_, dec)| !dec.allowed);
-
-                    if has_over_limit {
-                        let violated: Vec<(&RateLimit, &Decision)> = successful_decisions
-                            .iter()
-                            .filter(|(_, dec)| !dec.allowed)
-                            .map(|(l, d)| (*l, d))
-                            .collect();
-                        let status = aggregate_descriptor_status(&violated, default_ttl);
-                        statuses.push(status);
-                    } else if failed_rules.is_empty() {
-                        let pairs: Vec<(&RateLimit, &Decision)> =
-                            successful_decisions.iter().map(|(l, d)| (*l, d)).collect();
-                        let status = aggregate_descriptor_status(&pairs, default_ttl);
-                        statuses.push(status);
-                    } else {
-                        let gov_limit = successful_decisions
-                            .first()
-                            .map(|(l, _)| **l)
-                            .unwrap_or(desc_match.limits_to_check[0].1);
-                        let reset_secs = duration_until_reset_for(&gov_limit, default_ttl);
+            for eval in evaluations {
+                match eval {
+                    DescriptorEvaluation::Unmatched => {
+                        count(&self.metrics, "descriptors.unmatched", 1);
                         statuses.push(DescriptorStatus {
-                            code: Code::Unknown as i32,
-                            current_limit: Some(gov_limit.to_proto()),
+                            code: Code::Ok as i32,
+                            current_limit: None,
                             limit_remaining: 0,
-                            duration_until_reset: Some(prost_types::Duration {
-                                seconds: reset_secs as i64,
-                                nanos: 0,
-                            }),
+                            duration_until_reset: None,
                             quota: None,
                         });
                     }
+                    DescriptorEvaluation::Matched(desc_match) => {
+                        let mut successful_decisions =
+                            Vec::with_capacity(desc_match.limits_to_check.len());
+                        let mut failed_rules = Vec::new();
+
+                        for (key, limit) in &desc_match.limits_to_check {
+                            let result = self
+                                .execute_check_limit(key, limit, desc_match.operation)
+                                .await;
+                            match result {
+                                Ok(decision) => {
+                                    if !decision.allowed {
+                                        any_rule_over_limit = true;
+                                    }
+                                    successful_decisions.push((limit, decision));
+                                }
+                                Err(error) => {
+                                    if first_redis_error.is_none() {
+                                        first_redis_error = Some(error.clone());
+                                    }
+                                    failed_rules.push((limit, error));
+                                }
+                            }
+                        }
+
+                        let has_over_limit =
+                            successful_decisions.iter().any(|(_, dec)| !dec.allowed);
+
+                        if has_over_limit {
+                            let violated: Vec<(&RateLimit, &Decision)> = successful_decisions
+                                .iter()
+                                .filter(|(_, dec)| !dec.allowed)
+                                .map(|(l, d)| (*l, d))
+                                .collect();
+                            let status = aggregate_descriptor_status(&violated, default_ttl);
+                            statuses.push(status);
+                        } else if failed_rules.is_empty() {
+                            let pairs: Vec<(&RateLimit, &Decision)> =
+                                successful_decisions.iter().map(|(l, d)| (*l, d)).collect();
+                            let status = aggregate_descriptor_status(&pairs, default_ttl);
+                            statuses.push(status);
+                        } else {
+                            let gov_limit = successful_decisions
+                                .first()
+                                .map(|(l, _)| **l)
+                                .unwrap_or(desc_match.limits_to_check[0].1);
+                            let reset_secs = duration_until_reset_for(&gov_limit, default_ttl);
+                            statuses.push(DescriptorStatus {
+                                code: Code::Unknown as i32,
+                                current_limit: Some(gov_limit.to_proto()),
+                                limit_remaining: 0,
+                                duration_until_reset: Some(prost_types::Duration {
+                                    seconds: reset_secs as i64,
+                                    nanos: 0,
+                                }),
+                                quota: None,
+                            });
+                        }
+                    }
                 }
             }
-        }
+
+            (statuses, any_rule_over_limit, first_redis_error)
+        })
+        .await;
+
+        let (statuses, any_rule_over_limit, first_redis_error) = match eval_result {
+            Ok(result) => result,
+            Err(_elapsed) => {
+                count(&self.metrics, "redis.timeouts", 1);
+                count(&self.metrics, "requests.deadline_exceeded", 1);
+                return Err(tonic::Status::deadline_exceeded(
+                    "request execution deadline exceeded",
+                ));
+            }
+        };
 
         // 5. Overall response code aggregation & F06 Error Precedence Rule
         if any_rule_over_limit {
@@ -799,6 +907,7 @@ impl RateLimitService for Steward {
         } else if let Some(err) = first_redis_error {
             // Rule 2: If NO rule was over limit, but one or more backend operations failed with a Redis error
             if is_redis_timeout(&err) {
+                count(&self.metrics, "requests.deadline_exceeded", 1);
                 Err(tonic::Status::deadline_exceeded(
                     "rate limit storage backend request timed out",
                 ))
@@ -1442,6 +1551,10 @@ mod tests {
                 cadence::NopMetricSink,
             )),
             scripts: super::StewardScripts::default(),
+            execution_timeout: super::DEFAULT_EXECUTION_TIMEOUT,
+            admission_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                super::DEFAULT_MAX_CONCURRENT_REQUESTS,
+            )),
         };
         Some((server, steward, client))
     }
@@ -1480,6 +1593,10 @@ mod tests {
                 cadence::NopMetricSink,
             )),
             scripts: super::StewardScripts::default(),
+            execution_timeout: super::DEFAULT_EXECUTION_TIMEOUT,
+            admission_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                super::DEFAULT_MAX_CONCURRENT_REQUESTS,
+            )),
         };
 
         let mut conn = client.get_connection().unwrap();
@@ -1561,6 +1678,10 @@ mod tests {
                 cadence::NopMetricSink,
             )),
             scripts: super::StewardScripts::default(),
+            execution_timeout: super::DEFAULT_EXECUTION_TIMEOUT,
+            admission_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                super::DEFAULT_MAX_CONCURRENT_REQUESTS,
+            )),
         };
 
         let mut conn = client.get_connection().unwrap();
@@ -1639,6 +1760,10 @@ mod tests {
                 cadence::NopMetricSink,
             )),
             scripts: super::StewardScripts::default(),
+            execution_timeout: super::DEFAULT_EXECUTION_TIMEOUT,
+            admission_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                super::DEFAULT_MAX_CONCURRENT_REQUESTS,
+            )),
         };
 
         use crate::proto::envoy::extensions::common::ratelimit::v3::{
@@ -1782,6 +1907,7 @@ mod tests {
         let client = redis::Client::open("redis://127.0.0.1:1").unwrap();
         let mut config = redis::aio::ConnectionManagerConfig::new();
         config = config.set_connection_timeout(Some(std::time::Duration::from_millis(50)));
+        config = config.set_number_of_retries(1);
         let redis = redis::aio::ConnectionManager::new_lazy_with_config(client, config).unwrap();
 
         let steward = super::Steward {
@@ -1793,6 +1919,10 @@ mod tests {
                 cadence::NopMetricSink,
             )),
             scripts: super::StewardScripts::default(),
+            execution_timeout: std::time::Duration::from_secs(1),
+            admission_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                super::DEFAULT_MAX_CONCURRENT_REQUESTS,
+            )),
         };
 
         use crate::proto::envoy::extensions::common::ratelimit::v3::{
@@ -1863,6 +1993,10 @@ mod tests {
                 cadence::NopMetricSink,
             )),
             scripts: super::StewardScripts::default(),
+            execution_timeout: super::DEFAULT_EXECUTION_TIMEOUT,
+            admission_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                super::DEFAULT_MAX_CONCURRENT_REQUESTS,
+            )),
         };
 
         let mut conn = client.get_connection().unwrap();
@@ -1989,6 +2123,10 @@ mod tests {
                 cadence::NopMetricSink,
             )),
             scripts: super::StewardScripts::default(),
+            execution_timeout: super::DEFAULT_EXECUTION_TIMEOUT,
+            admission_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                super::DEFAULT_MAX_CONCURRENT_REQUESTS,
+            )),
         };
 
         use crate::proto::envoy::extensions::common::ratelimit::v3::{
@@ -3076,6 +3214,10 @@ mod tests {
                 cadence::NopMetricSink,
             )),
             scripts: super::StewardScripts::default(),
+            execution_timeout: super::DEFAULT_EXECUTION_TIMEOUT,
+            admission_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                super::DEFAULT_MAX_CONCURRENT_REQUESTS,
+            )),
         };
 
         let make_req = || RateLimitRequest {
@@ -3118,5 +3260,337 @@ mod tests {
             "backend failure when Redis is killed must return Unavailable for Envoy failure_mode_deny handling"
         );
         assert_eq!(err.message(), "rate limit storage backend is unavailable");
+    }
+
+    #[test]
+    fn test_parse_grpc_timeout() {
+        assert_eq!(
+            super::parse_grpc_timeout("100m"),
+            Some(std::time::Duration::from_millis(100))
+        );
+        assert_eq!(
+            super::parse_grpc_timeout("1S"),
+            Some(std::time::Duration::from_secs(1))
+        );
+        assert_eq!(
+            super::parse_grpc_timeout("500000u"),
+            Some(std::time::Duration::from_micros(500_000))
+        );
+        assert_eq!(
+            super::parse_grpc_timeout("2H"),
+            Some(std::time::Duration::from_secs(7200))
+        );
+        assert_eq!(
+            super::parse_grpc_timeout("10M"),
+            Some(std::time::Duration::from_secs(600))
+        );
+        assert_eq!(
+            super::parse_grpc_timeout("1000n"),
+            Some(std::time::Duration::from_nanos(1000))
+        );
+
+        // Malformed headers
+        assert_eq!(super::parse_grpc_timeout(""), None);
+        assert_eq!(super::parse_grpc_timeout("abc"), None);
+        assert_eq!(super::parse_grpc_timeout("100"), None);
+        assert_eq!(super::parse_grpc_timeout("100x"), None);
+        assert_eq!(super::parse_grpc_timeout("-5m"), None);
+        assert_eq!(super::parse_grpc_timeout("m"), None);
+        assert_eq!(super::parse_grpc_timeout("100ms"), None);
+        assert_eq!(super::parse_grpc_timeout("invalid"), None);
+        assert_eq!(super::parse_grpc_timeout("100 m"), None);
+    }
+
+    #[tokio::test]
+    async fn test_effective_timeout_calculation() {
+        let json_str = r#"{
+            "domain": "default",
+            "descriptors": [
+                {
+                    "key": "action",
+                    "value": "search",
+                    "rate_limit": { "unit": "seconds", "requests_per_unit": 10 }
+                }
+            ]
+        }"#;
+        let raw: crate::config_source::RawRateLimitsConfig =
+            serde_json::from_str(json_str).unwrap();
+        let default_config = crate::config_source::compile_rate_limits(raw).unwrap();
+        let (_tx, rx) = tokio::sync::watch::channel(default_config);
+        let steward = super::Steward {
+            config_rx: rx,
+            redis: redis::aio::ConnectionManager::new_lazy_with_config(
+                redis::Client::open("redis://127.0.0.1:1").unwrap(),
+                redis::aio::ConnectionManagerConfig::default(),
+            )
+            .unwrap(),
+            default_ttl: 10,
+            metrics: std::sync::Arc::new(cadence::StatsdClient::from_sink(
+                "",
+                cadence::NopMetricSink,
+            )),
+            scripts: super::StewardScripts::default(),
+            execution_timeout: std::time::Duration::from_millis(10),
+            admission_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(1024)),
+        };
+
+        // No client header -> defaults to execution_timeout (10ms)
+        assert_eq!(
+            steward.effective_timeout(None),
+            std::time::Duration::from_millis(10)
+        );
+
+        // Client deadline 100ms -> min(100ms - 2ms, 10ms) = 10ms
+        assert_eq!(
+            steward.effective_timeout(Some(std::time::Duration::from_millis(100))),
+            std::time::Duration::from_millis(10)
+        );
+
+        // Client deadline 5ms -> min(5ms - 2ms, 10ms) = 3ms
+        assert_eq!(
+            steward.effective_timeout(Some(std::time::Duration::from_millis(5))),
+            std::time::Duration::from_millis(3)
+        );
+
+        // Client deadline 2ms -> min(max(2ms - 2ms, 1ms), 10ms) = 1ms
+        assert_eq!(
+            steward.effective_timeout(Some(std::time::Duration::from_millis(2))),
+            std::time::Duration::from_millis(1)
+        );
+
+        // Client deadline 1ms -> min(max(1ms - 2ms, 1ms), 10ms) = 1ms
+        assert_eq!(
+            steward.effective_timeout(Some(std::time::Duration::from_millis(1))),
+            std::time::Duration::from_millis(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_global_admission_limit_sheds_excess_load() {
+        use crate::proto::envoy::extensions::common::ratelimit::v3::{
+            RateLimitDescriptor, rate_limit_descriptor::Entry,
+        };
+        use crate::proto::envoy::service::ratelimit::v3::RateLimitRequest;
+        use crate::proto::envoy::service::ratelimit::v3::rate_limit_service_server::RateLimitService;
+
+        let json_str = r#"{
+            "domain": "default",
+            "descriptors": [
+                {
+                    "key": "action",
+                    "value": "search",
+                    "rate_limit": { "unit": "seconds", "requests_per_unit": 10 }
+                }
+            ]
+        }"#;
+        let raw: crate::config_source::RawRateLimitsConfig =
+            serde_json::from_str(json_str).unwrap();
+        let compiled = crate::config_source::compile_rate_limits(raw).unwrap();
+        let (_tx, rx) = tokio::sync::watch::channel(compiled);
+
+        // Configure Steward with 0 available permits in admission semaphore
+        let steward = super::Steward::for_test(rx)
+            .await
+            .with_max_concurrent_requests(0);
+
+        let request = RateLimitRequest {
+            domain: "default".to_string(),
+            descriptors: vec![RateLimitDescriptor {
+                entries: vec![Entry {
+                    key: "action".to_string(),
+                    value: "search".to_string(),
+                }],
+                limit: None,
+                hits_addend: Some(1),
+                is_negative_hits: false,
+            }],
+            hits_addend: 0,
+        };
+
+        // When semaphore has 0 available permits, request is rejected immediately with ResourceExhausted
+        let err = steward
+            .should_rate_limit(tonic::Request::new(request))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(
+            err.message(),
+            "admission limit reached; request rejected due to load shedding"
+        );
+        assert_eq!(steward.admission_semaphore.available_permits(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_global_admission_limit_permits_retained_during_execution_and_released() {
+        use crate::proto::envoy::extensions::common::ratelimit::v3::{
+            RateLimitDescriptor, rate_limit_descriptor::Entry,
+        };
+        use crate::proto::envoy::service::ratelimit::v3::RateLimitRequest;
+        use crate::proto::envoy::service::ratelimit::v3::rate_limit_service_server::RateLimitService;
+
+        let json_str = r#"{
+            "domain": "default",
+            "descriptors": [
+                {
+                    "key": "action",
+                    "value": "search",
+                    "rate_limit": { "unit": "seconds", "requests_per_unit": 10 }
+                }
+            ]
+        }"#;
+        let raw: crate::config_source::RawRateLimitsConfig =
+            serde_json::from_str(json_str).unwrap();
+        let compiled = crate::config_source::compile_rate_limits(raw).unwrap();
+        let (_tx, rx) = tokio::sync::watch::channel(compiled);
+
+        let steward = super::Steward::for_test(rx)
+            .await
+            .with_max_concurrent_requests(1);
+
+        assert_eq!(steward.admission_semaphore.available_permits(), 1);
+
+        let request = RateLimitRequest {
+            domain: "unconfigured".to_string(),
+            descriptors: vec![RateLimitDescriptor {
+                entries: vec![Entry {
+                    key: "action".to_string(),
+                    value: "search".to_string(),
+                }],
+                limit: None,
+                hits_addend: Some(1),
+                is_negative_hits: false,
+            }],
+            hits_addend: 0,
+        };
+
+        let res = steward
+            .should_rate_limit(tonic::Request::new(request))
+            .await;
+        assert!(res.is_ok());
+
+        // Permit was released upon request completion
+        assert_eq!(steward.admission_semaphore.available_permits(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_request_deadline_expiration_returns_deadline_exceeded() {
+        use crate::proto::envoy::extensions::common::ratelimit::v3::{
+            RateLimitDescriptor, rate_limit_descriptor::Entry,
+        };
+        use crate::proto::envoy::service::ratelimit::v3::RateLimitRequest;
+        use crate::proto::envoy::service::ratelimit::v3::rate_limit_service_server::RateLimitService;
+
+        let Some((port, mut child)) = spawn_dedicated_ephemeral_redis() else {
+            eprintln!("Skipping test: redis-server command not available");
+            return;
+        };
+
+        let client = redis::Client::open(format!("redis://127.0.0.1:{port}")).unwrap();
+        let redis = redis::aio::ConnectionManager::new(client.clone())
+            .await
+            .unwrap();
+
+        let domain = "deadline_test";
+        let config_json = format!(
+            r#"{{
+            "domain": "{domain}",
+            "descriptors": [
+                {{
+                    "key": "action",
+                    "value": "search",
+                    "rate_limit": {{ "algorithm": "fixed_window", "unit": "seconds", "requests_per_unit": 10 }}
+                }}
+            ]
+        }}"#
+        );
+
+        let raw: crate::config_source::RawRateLimitsConfig =
+            serde_json::from_str(&config_json).unwrap();
+        let compiled = crate::config_source::compile_rate_limits(raw).unwrap();
+        let (_tx, rx) = tokio::sync::watch::channel(compiled);
+        let steward = super::Steward {
+            config_rx: rx,
+            redis,
+            default_ttl: 10,
+            metrics: std::sync::Arc::new(cadence::StatsdClient::from_sink(
+                "",
+                cadence::NopMetricSink,
+            )),
+            scripts: super::StewardScripts::default(),
+            execution_timeout: std::time::Duration::from_millis(10),
+            admission_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(1024)),
+        };
+
+        let make_req = || RateLimitRequest {
+            domain: domain.to_string(),
+            descriptors: vec![RateLimitDescriptor {
+                entries: vec![Entry {
+                    key: "action".to_string(),
+                    value: "search".to_string(),
+                }],
+                limit: None,
+                hits_addend: Some(1),
+                is_negative_hits: false,
+            }],
+            hits_addend: 0,
+        };
+
+        // First verify normal request succeeds
+        let initial_res = steward
+            .should_rate_limit(tonic::Request::new(make_req()))
+            .await
+            .unwrap();
+        assert_eq!(initial_res.into_inner().overall_code, Code::Ok as i32);
+
+        // Pause Redis for 2000 ms using a synchronous client connection
+        let mut sync_conn = client.get_connection().unwrap();
+        let _: () = redis::cmd("CLIENT")
+            .arg("PAUSE")
+            .arg(2000)
+            .query(&mut sync_conn)
+            .unwrap();
+
+        // 1. Test internal execution_timeout expiration (10ms expires well before Redis unpauses in 2000ms)
+        let req = tonic::Request::new(make_req());
+        let start = std::time::Instant::now();
+        let err = steward.should_rate_limit(req).await.unwrap_err();
+        let elapsed = start.elapsed();
+
+        assert_eq!(err.code(), tonic::Code::DeadlineExceeded);
+        assert_eq!(err.message(), "request execution deadline exceeded");
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "elapsed was {:?}",
+            elapsed
+        );
+
+        // 2. Test grpc-timeout header parsing and enforcement (e.g. 5m -> effective 3ms)
+        let mut req_with_timeout = tonic::Request::new(make_req());
+        req_with_timeout
+            .metadata_mut()
+            .insert("grpc-timeout", "5m".parse().unwrap());
+        let start = std::time::Instant::now();
+        let err = steward
+            .should_rate_limit(req_with_timeout)
+            .await
+            .unwrap_err();
+        let elapsed = start.elapsed();
+
+        assert_eq!(err.code(), tonic::Code::DeadlineExceeded);
+        assert_eq!(err.message(), "request execution deadline exceeded");
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "elapsed was {:?}",
+            elapsed
+        );
+
+        // Unpause Redis and kill server
+        let _: () = redis::cmd("CLIENT")
+            .arg("UNPAUSE")
+            .query(&mut sync_conn)
+            .unwrap_or(());
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
