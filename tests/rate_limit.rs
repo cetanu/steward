@@ -42,9 +42,9 @@ async fn envoy_allows_requests_then_returns_rate_limit_response() {
 
     // Isolate Redis state if Redis is reachable on default port 6379
     if let Ok(redis_client) = redis::Client::open("redis://127.0.0.1:6379")
-        && let Ok(mut conn) = redis_client.get_connection()
+        && let Ok(mut conn) = redis_client.get_connection_manager().await
     {
-        let _: Result<(), _> = redis::cmd("FLUSHDB").query(&mut conn);
+        let _: Result<(), _> = redis::cmd("FLUSHDB").query_async(&mut conn).await;
     }
 
     let mut ok_response = None;

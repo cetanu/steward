@@ -351,7 +351,7 @@ Milestones are dependency ordered. Each should leave a deployable development pr
 
 ### M2 tasks — Bound work and certify performance
 
-- [ ] **M2.1:** Replace the sync pool with the Redis crate's async connection manager; remove `r2d2` and `block_in_place`; construct script objects once; retain typed descriptor associations.
+- [x] **M2.1:** Replace the sync pool with the Redis crate's async connection manager; remove `r2d2` and `block_in_place`; construct script objects once; retain typed descriptor associations.
 - [ ] **M2.2:** Enforce RPC/backend/admission deadlines, global concurrency and queue bounds, Tonic message/stream limits, and explicit Envoy RPC timeouts. Verify ambiguous timeout behavior without blind mutation retries.
 - [ ] **M2.3:** Implement authoritative time and globally unique sliding events. Enforce numeric, event, pruning, and hit-cost limits. Remove unchecked short-array defaults for script outcomes.
 - [ ] **M2.4:** Certify token and sliding reference models, boundaries, weighted costs/refunds within supported scope, concurrency, clock regression, expiry, capacity edits, and two-replica behavior. Include Redis cardinality/state assertions.
