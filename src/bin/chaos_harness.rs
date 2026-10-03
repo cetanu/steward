@@ -176,7 +176,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let steward = Steward::try_new(
             &format!("127.0.0.1:{redis_port}"),
-            10,
             rx,
             Arc::new(cadence::StatsdClient::from_sink("", cadence::NopMetricSink)),
         )
@@ -288,7 +287,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let steward = Steward::try_new(
             &format!("127.0.0.1:{redis_port}"),
-            10,
             rx,
             Arc::new(cadence::StatsdClient::from_sink("", cadence::NopMetricSink)),
         )
@@ -382,7 +380,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let steward = Steward::try_new(
             &format!("127.0.0.1:{redis_port}"),
-            10,
             rx,
             Arc::new(cadence::StatsdClient::from_sink("", cadence::NopMetricSink)),
         )
@@ -488,7 +485,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let statsd_sink = cadence::UdpMetricSink::from("127.0.0.1:19999", udp_socket)?;
         let statsd = Arc::new(cadence::StatsdClient::from_sink("steward", statsd_sink));
 
-        let steward = Steward::try_new(&format!("127.0.0.1:{redis_port}"), 10, rx, statsd)
+        let steward = Steward::try_new(&format!("127.0.0.1:{redis_port}"), rx, statsd)
             .await?
             .with_execution_timeout(Duration::from_millis(100));
 
@@ -565,7 +562,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let steward = Steward::try_new(
             &format!("127.0.0.1:{redis_port}"),
-            10,
             rx,
             Arc::new(cadence::StatsdClient::from_sink("", cadence::NopMetricSink)),
         )

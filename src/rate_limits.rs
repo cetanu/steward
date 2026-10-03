@@ -20,6 +20,12 @@ impl From<&RateLimitOverride> for RateLimit {
     }
 }
 
+impl From<RateLimitOverride> for RateLimit {
+    fn from(value: RateLimitOverride) -> Self {
+        Self::from(&value)
+    }
+}
+
 #[derive(Debug, Default, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum Algorithm {
@@ -81,15 +87,13 @@ impl From<i32> for Unit {
 
 impl From<Unit> for usize {
     fn from(value: Unit) -> Self {
-        match value {
-            Unit::Unknown => 0,
-            Unit::Seconds => 1,
-            Unit::Minutes => 60,
-            Unit::Hours => 3600,
-            Unit::Days => 86400,
-            Unit::Months => 2592000,
-            Unit::Years => 31536000,
-        }
+        value.seconds().unwrap_or(0) as usize
+    }
+}
+
+impl From<Unit> for i32 {
+    fn from(value: Unit) -> Self {
+        value.to_proto()
     }
 }
 
@@ -161,11 +165,9 @@ impl RateLimit {
     }
 
     pub fn with_override(&self, override_: &RateLimitOverride) -> Self {
-        Self {
-            algorithm: self.algorithm,
-            requests_per_unit: override_.requests_per_unit as i64,
-            unit: Unit::from(override_.unit),
-        }
+        let mut limit = RateLimit::from(override_);
+        limit.algorithm = self.algorithm;
+        limit
     }
 
     pub fn to_proto(
@@ -355,10 +357,9 @@ pub fn rate_limit_key(
     policy_id: &str,
     encoded_path: &str,
     limit: &RateLimit,
-    default_ttl: usize,
 ) -> String {
     let algo_code = limit.algorithm.short_code();
-    let unit_seconds = limit.unit.seconds().unwrap_or(default_ttl as u64);
+    let unit_seconds = limit.unit.seconds().unwrap_or(60);
     let unit_spec = format!("{unit_seconds}s");
     format!("steward:{{{domain}}}:v1:{policy_id}:{encoded_path}:{algo_code}:{unit_spec}")
 }
@@ -615,7 +616,7 @@ mod tests {
         let entries1 = [("remote_address", "192.168.1.1")];
         let m1 = trie.match_entries(&entries1).unwrap();
         let path1 = encode_canonical_path(entries1);
-        let key1 = rate_limit_key("default", m1.policy_id, &path1, &m1.rate_limits[0], 10);
+        let key1 = rate_limit_key("default", m1.policy_id, &path1, &m1.rate_limits[0]);
         assert_eq!(
             key1,
             "steward:{default}:v1:default:14:remote_address=11:192.168.1.1:fw:1s"
@@ -624,7 +625,7 @@ mod tests {
         let entries2 = [("remote_address", "10.0.0.1")];
         let m2 = trie.match_entries(&entries2).unwrap();
         let path2 = encode_canonical_path(entries2);
-        let key2 = rate_limit_key("default", m2.policy_id, &path2, &m2.rate_limits[0], 10);
+        let key2 = rate_limit_key("default", m2.policy_id, &path2, &m2.rate_limits[0]);
         assert_eq!(
             key2,
             "steward:{default}:v1:default:14:remote_address=8:10.0.0.1:fw:1s"
@@ -667,8 +668,8 @@ mod tests {
         assert_eq!(m.rate_limits[1].requests_per_unit, 100);
 
         let path = encode_canonical_path(entries);
-        let key_sec = rate_limit_key("default", m.policy_id, &path, &m.rate_limits[0], 10);
-        let key_min = rate_limit_key("default", m.policy_id, &path, &m.rate_limits[1], 10);
+        let key_sec = rate_limit_key("default", m.policy_id, &path, &m.rate_limits[0]);
+        let key_min = rate_limit_key("default", m.policy_id, &path, &m.rate_limits[1]);
 
         assert_eq!(
             key_sec,
@@ -693,7 +694,7 @@ mod tests {
         };
         let entries1 = [("tenant", "acme"), ("route", "/pay")];
         let path1 = encode_canonical_path(entries1);
-        let key_fw = rate_limit_key("default", "pol_pay", &path1, &limit_fw, 10);
+        let key_fw = rate_limit_key("default", "pol_pay", &path1, &limit_fw);
         assert_eq!(
             key_fw,
             "steward:{default}:v1:pol_pay:6:tenant=4:acme/5:route=4:/pay:fw:60s"
@@ -708,7 +709,7 @@ mod tests {
         };
         let entries2 = [("tenant", "acme"), ("user_id", "user_891")];
         let path2 = encode_canonical_path(entries2);
-        let key_tb = rate_limit_key("default", "pol_api", &path2, &limit_tb, 10);
+        let key_tb = rate_limit_key("default", "pol_api", &path2, &limit_tb);
         assert_eq!(
             key_tb,
             "steward:{default}:v1:pol_api:6:tenant=4:acme/7:user_id=8:user_891:tb:1s"
@@ -719,7 +720,7 @@ mod tests {
             requests_per_unit: 200,
             ..limit_tb
         };
-        let key_tuned = rate_limit_key("default", "pol_api", &path2, &limit_tuned, 10);
+        let key_tuned = rate_limit_key("default", "pol_api", &path2, &limit_tuned);
         assert_eq!(key_tb, key_tuned);
     }
 
@@ -765,13 +766,13 @@ mod tests {
             requests_per_unit: 10,
         };
         let path = encode_canonical_path([("service", "payment")]);
-        let key_base = rate_limit_key("default", "policy_1", &path, &base_limit, 10);
+        let key_base = rate_limit_key("default", "policy_1", &path, &base_limit);
 
         let modified_limit = RateLimit {
             requests_per_unit: 1000,
             ..base_limit
         };
-        let key_modified = rate_limit_key("default", "policy_1", &path, &modified_limit, 10);
+        let key_modified = rate_limit_key("default", "policy_1", &path, &modified_limit);
 
         assert_eq!(key_base, key_modified);
     }
