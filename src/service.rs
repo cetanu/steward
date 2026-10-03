@@ -17,7 +17,7 @@ use crate::proto::envoy::service::ratelimit::v3::rate_limit_response::{Code, Des
 use crate::proto::envoy::service::ratelimit::v3::rate_limit_service_server::RateLimitService;
 use crate::proto::envoy::service::ratelimit::v3::{RateLimitRequest, RateLimitResponse};
 use crate::rate_limits::{Algorithm, RateLimit, encode_canonical_path, rate_limit_key};
-use crate::response::{build_response, limit_response};
+use crate::response::build_response;
 
 pub use crate::config_source::CompiledConfig;
 
@@ -279,22 +279,51 @@ impl Steward {
         }
     }
 
-    fn check_limit_fail_open(&self, key: &str, limit: &RateLimit, op: HitOperation) -> Decision {
+    pub fn execute_check_limit(
+        &self,
+        key: &str,
+        limit: &RateLimit,
+        op: HitOperation,
+    ) -> Result<Decision, redis::RedisError> {
         let started = std::time::Instant::now();
-        let decision = match self.check_limit(key, limit, op) {
-            Ok(decision) => decision,
+        let res = self.check_limit(key, limit, op);
+        time(&self.metrics, "redis.operation_time", started.elapsed());
+        match &res {
+            Ok(decision) => {
+                gauge(
+                    &self.metrics,
+                    "rate_limit.observed",
+                    decision.observed.max(0) as u64,
+                );
+            }
             Err(error) => {
                 error!(rate_limit_key = key, %error, "failed to update rate limit in Redis");
-                count(&self.metrics, "redis.errors", 1);
-                Decision {
-                    allowed: true,
-                    observed: 0,
+                if is_redis_timeout(error) {
+                    count(&self.metrics, "redis.timeouts", 1);
+                } else {
+                    count(&self.metrics, "redis.errors", 1);
                 }
             }
-        };
-        time(&self.metrics, "redis.operation_time", started.elapsed());
-        decision
+        }
+        res
     }
+}
+
+pub fn is_redis_timeout(err: &redis::RedisError) -> bool {
+    if err.is_timeout() {
+        return true;
+    }
+    let desc = err.to_string().to_lowercase();
+    if desc.contains("failed to acquire redis connection") {
+        return false;
+    }
+    if let Some(detail) = err.detail() {
+        let lower = detail.to_lowercase();
+        if lower.contains("timeout") || lower.contains("timed out") || lower.contains("deadline") {
+            return true;
+        }
+    }
+    desc.contains("timeout") || desc.contains("timed out") || desc.contains("deadline")
 }
 
 fn now_millis() -> i64 {
@@ -332,6 +361,16 @@ pub fn aggregate_descriptor_status(
     limit_decisions: &[(&RateLimit, &Decision)],
     default_ttl: usize,
 ) -> DescriptorStatus {
+    if limit_decisions.is_empty() {
+        return DescriptorStatus {
+            code: Code::Ok as i32,
+            current_limit: None,
+            limit_remaining: 0,
+            duration_until_reset: None,
+            quota: None,
+        };
+    }
+
     let any_over = limit_decisions.iter().any(|(_, dec)| !dec.allowed);
 
     if any_over {
@@ -534,7 +573,21 @@ impl RateLimitService for Steward {
             let configs = self.config_rx.borrow();
             let Some(domain_policy) = configs.get(&request.domain) else {
                 count(&self.metrics, "requests.unconfigured", 1);
-                return Ok(Response::new(limit_response(false)));
+                let statuses = request
+                    .descriptors
+                    .iter()
+                    .map(|_| {
+                        count(&self.metrics, "descriptors.unmatched", 1);
+                        DescriptorStatus {
+                            code: Code::Ok as i32,
+                            current_limit: None,
+                            limit_remaining: 0,
+                            duration_until_reset: None,
+                            quota: None,
+                        }
+                    })
+                    .collect();
+                return Ok(Response::new(build_response(false, statuses)));
             };
 
             let mut evals = Vec::with_capacity(request.descriptors.len());
@@ -614,59 +667,118 @@ impl RateLimitService for Steward {
 
         // 4. Redis Evaluation Phase (preserving 1:1 input descriptor order)
         let default_ttl = self.default_ttl;
-        let statuses: Vec<DescriptorStatus> = tokio::task::block_in_place(|| {
-            let mut statuses = Vec::with_capacity(evaluations.len());
-            for eval in evaluations {
-                match eval {
-                    DescriptorEvaluation::Unmatched => {
-                        count(&self.metrics, "descriptors.unmatched", 1);
-                        statuses.push(DescriptorStatus {
-                            code: Code::Ok as i32,
-                            current_limit: None,
-                            limit_remaining: 0,
-                            duration_until_reset: None,
-                            quota: None,
-                        });
-                    }
-                    DescriptorEvaluation::Matched(desc_match) => {
-                        let mut limit_decisions =
-                            Vec::with_capacity(desc_match.limits_to_check.len());
-                        for (key, limit) in &desc_match.limits_to_check {
-                            let decision =
-                                self.check_limit_fail_open(key, limit, desc_match.operation);
-                            gauge(
-                                &self.metrics,
-                                "rate_limit.observed",
-                                decision.observed.max(0) as u64,
-                            );
-                            limit_decisions.push((limit, decision));
-                        }
+        let (statuses, any_rule_over_limit, first_redis_error) =
+            tokio::task::block_in_place(|| {
+                let mut statuses = Vec::with_capacity(evaluations.len());
+                let mut any_rule_over_limit = false;
+                let mut first_redis_error = None;
 
-                        let pairs: Vec<(&RateLimit, &Decision)> =
-                            limit_decisions.iter().map(|(l, d)| (*l, d)).collect();
-                        let status = aggregate_descriptor_status(&pairs, default_ttl);
-                        statuses.push(status);
+                for eval in evaluations {
+                    match eval {
+                        DescriptorEvaluation::Unmatched => {
+                            count(&self.metrics, "descriptors.unmatched", 1);
+                            statuses.push(DescriptorStatus {
+                                code: Code::Ok as i32,
+                                current_limit: None,
+                                limit_remaining: 0,
+                                duration_until_reset: None,
+                                quota: None,
+                            });
+                        }
+                        DescriptorEvaluation::Matched(desc_match) => {
+                            let mut successful_decisions =
+                                Vec::with_capacity(desc_match.limits_to_check.len());
+                            let mut failed_rules = Vec::new();
+
+                            for (key, limit) in &desc_match.limits_to_check {
+                                let result =
+                                    self.execute_check_limit(key, limit, desc_match.operation);
+                                match result {
+                                    Ok(decision) => {
+                                        if !decision.allowed {
+                                            any_rule_over_limit = true;
+                                        }
+                                        successful_decisions.push((limit, decision));
+                                    }
+                                    Err(error) => {
+                                        if first_redis_error.is_none() {
+                                            first_redis_error = Some(error.clone());
+                                        }
+                                        failed_rules.push((limit, error));
+                                    }
+                                }
+                            }
+
+                            let has_over_limit =
+                                successful_decisions.iter().any(|(_, dec)| !dec.allowed);
+
+                            if has_over_limit {
+                                let violated: Vec<(&RateLimit, &Decision)> = successful_decisions
+                                    .iter()
+                                    .filter(|(_, dec)| !dec.allowed)
+                                    .map(|(l, d)| (*l, d))
+                                    .collect();
+                                let status = aggregate_descriptor_status(&violated, default_ttl);
+                                statuses.push(status);
+                            } else if failed_rules.is_empty() {
+                                let pairs: Vec<(&RateLimit, &Decision)> =
+                                    successful_decisions.iter().map(|(l, d)| (*l, d)).collect();
+                                let status = aggregate_descriptor_status(&pairs, default_ttl);
+                                statuses.push(status);
+                            } else {
+                                let gov_limit = successful_decisions
+                                    .first()
+                                    .map(|(l, _)| **l)
+                                    .unwrap_or(desc_match.limits_to_check[0].1);
+                                let reset_secs = duration_until_reset_for(&gov_limit, default_ttl);
+                                statuses.push(DescriptorStatus {
+                                    code: Code::Unknown as i32,
+                                    current_limit: Some(gov_limit.to_proto()),
+                                    limit_remaining: 0,
+                                    duration_until_reset: Some(prost_types::Duration {
+                                        seconds: reset_secs as i64,
+                                        nanos: 0,
+                                    }),
+                                    quota: None,
+                                });
+                            }
+                        }
                     }
                 }
-            }
-            statuses
-        });
+                (statuses, any_rule_over_limit, first_redis_error)
+            });
 
-        // 5. Overall response code aggregation
-        let overall_over = statuses.iter().any(|s| s.code == Code::OverLimit as i32);
-        if overall_over {
+        // 5. Overall response code aggregation & F06 Error Precedence Rule
+        if any_rule_over_limit {
+            // Rule 1: Definitive quota rejection WINS!
             count(&self.metrics, "requests.over_limit", 1);
             warn!(domain = %request.domain, "request is over the rate limit");
+            info!(
+                domain = %request.domain,
+                over_limit = true,
+                "rate limit decision complete"
+            );
+            Ok(Response::new(build_response(true, statuses)))
+        } else if let Some(err) = first_redis_error {
+            // Rule 2: If NO rule was over limit, but one or more backend operations failed with a Redis error
+            if is_redis_timeout(&err) {
+                Err(tonic::Status::deadline_exceeded(
+                    "rate limit storage backend request timed out",
+                ))
+            } else {
+                Err(tonic::Status::unavailable(
+                    "rate limit storage backend is unavailable",
+                ))
+            }
         } else {
             count(&self.metrics, "requests.allowed", 1);
+            info!(
+                domain = %request.domain,
+                over_limit = false,
+                "rate limit decision complete"
+            );
+            Ok(Response::new(build_response(false, statuses)))
         }
-
-        info!(
-            domain = %request.domain,
-            over_limit = overall_over,
-            "rate limit decision complete"
-        );
-        Ok(Response::new(build_response(overall_over, statuses)))
     }
 }
 
@@ -1396,5 +1508,538 @@ mod tests {
 
         // Clean up
         let _: () = redis::cmd("DEL").arg(test_key).query(&mut conn).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn direct_grpc_assertions_ordered_statuses_limits_remaining_and_reset() {
+        let Some(server) = TestRedisServer::start() else {
+            eprintln!("Skipping test: redis-server not available");
+            return;
+        };
+
+        let client = redis::Client::open(format!("redis://127.0.0.1:{}", server.port)).unwrap();
+        let pool = r2d2::Pool::builder().build(client).unwrap();
+        let json_str = r#"{
+            "domain": "default",
+            "descriptors": [
+                {
+                    "key": "users",
+                    "value": "alice",
+                    "rate_limit": { "algorithm": "fixed_window", "unit": "seconds", "requests_per_unit": 10 }
+                },
+                {
+                    "key": "orgs",
+                    "value": "acme",
+                    "rate_limit": { "algorithm": "fixed_window", "unit": "minutes", "requests_per_unit": 100 }
+                }
+            ]
+        }"#;
+        let raw: crate::config_source::RawRateLimitsConfig =
+            serde_json::from_str(json_str).unwrap();
+        let compiled = crate::config_source::compile_rate_limits(raw).unwrap();
+        let (_tx, rx) = tokio::sync::watch::channel(compiled);
+        let steward = super::Steward {
+            config_rx: rx,
+            redis_pool: pool,
+            default_ttl: 10,
+            metrics: std::sync::Arc::new(cadence::StatsdClient::from_sink(
+                "",
+                cadence::NopMetricSink,
+            )),
+        };
+
+        use crate::proto::envoy::extensions::common::ratelimit::v3::{
+            RateLimitDescriptor, rate_limit_descriptor::Entry,
+        };
+        use crate::proto::envoy::service::ratelimit::v3::RateLimitRequest;
+        use crate::proto::envoy::service::ratelimit::v3::rate_limit_service_server::RateLimitService;
+
+        // Request 1: 4 hits on users=alice, 15 hits on orgs=acme
+        let req1 = RateLimitRequest {
+            domain: "default".to_string(),
+            descriptors: vec![
+                RateLimitDescriptor {
+                    entries: vec![Entry {
+                        key: "users".to_string(),
+                        value: "alice".to_string(),
+                    }],
+                    limit: None,
+                    hits_addend: Some(4),
+                    is_negative_hits: false,
+                },
+                RateLimitDescriptor {
+                    entries: vec![Entry {
+                        key: "orgs".to_string(),
+                        value: "acme".to_string(),
+                    }],
+                    limit: None,
+                    hits_addend: Some(15),
+                    is_negative_hits: false,
+                },
+            ],
+            hits_addend: 0,
+        };
+
+        let resp1 = steward
+            .should_rate_limit(tonic::Request::new(req1))
+            .await
+            .expect("should_rate_limit succeeded")
+            .into_inner();
+
+        assert_eq!(resp1.overall_code, Code::Ok as i32);
+        assert_eq!(
+            resp1.statuses.len(),
+            2,
+            "must maintain strict 1:1 descriptor ordering"
+        );
+
+        // Status 0: users=alice (limit: 10/s, remaining: 6)
+        let s0 = &resp1.statuses[0];
+        assert_eq!(s0.code, Code::Ok as i32);
+        let lim0 = s0.current_limit.as_ref().expect("current_limit present");
+        assert_eq!(lim0.requests_per_unit, 10);
+        assert_eq!(lim0.unit, 1); // Second
+        assert_eq!(s0.limit_remaining, 6);
+        let reset0 = s0
+            .duration_until_reset
+            .as_ref()
+            .expect("duration_until_reset present");
+        assert!(reset0.seconds > 0 && reset0.seconds <= 1);
+        assert_eq!(reset0.nanos, 0);
+
+        // Status 1: orgs=acme (limit: 100/min, remaining: 85)
+        let s1 = &resp1.statuses[1];
+        assert_eq!(s1.code, Code::Ok as i32);
+        let lim1 = s1.current_limit.as_ref().expect("current_limit present");
+        assert_eq!(lim1.requests_per_unit, 100);
+        assert_eq!(lim1.unit, 2); // Minute
+        assert_eq!(s1.limit_remaining, 85);
+        let reset1 = s1
+            .duration_until_reset
+            .as_ref()
+            .expect("duration_until_reset present");
+        assert!(reset1.seconds > 0 && reset1.seconds <= 60);
+        assert_eq!(reset1.nanos, 0);
+
+        // Request 2: additional 7 hits on users=alice (4 + 7 = 11 > 10 => OVER_LIMIT), 5 hits on orgs=acme (15 + 5 = 20 <= 100)
+        let req2 = RateLimitRequest {
+            domain: "default".to_string(),
+            descriptors: vec![
+                RateLimitDescriptor {
+                    entries: vec![Entry {
+                        key: "users".to_string(),
+                        value: "alice".to_string(),
+                    }],
+                    limit: None,
+                    hits_addend: Some(7),
+                    is_negative_hits: false,
+                },
+                RateLimitDescriptor {
+                    entries: vec![Entry {
+                        key: "orgs".to_string(),
+                        value: "acme".to_string(),
+                    }],
+                    limit: None,
+                    hits_addend: Some(5),
+                    is_negative_hits: false,
+                },
+            ],
+            hits_addend: 0,
+        };
+
+        let resp2 = steward
+            .should_rate_limit(tonic::Request::new(req2))
+            .await
+            .expect("should_rate_limit succeeded")
+            .into_inner();
+
+        assert_eq!(resp2.overall_code, Code::OverLimit as i32);
+        assert_eq!(resp2.statuses.len(), 2);
+
+        // Status 0: users=alice is now OVER_LIMIT
+        let s0_2 = &resp2.statuses[0];
+        assert_eq!(s0_2.code, Code::OverLimit as i32);
+        assert_eq!(s0_2.limit_remaining, 0);
+        assert!(s0_2.duration_until_reset.is_some());
+
+        // Status 1: orgs=acme is still OK, remaining is 80
+        let s1_2 = &resp2.statuses[1];
+        assert_eq!(s1_2.code, Code::Ok as i32);
+        assert_eq!(s1_2.limit_remaining, 80);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn redis_error_returns_unavailable_when_no_rule_over_limit() {
+        let json_str = r#"{
+            "domain": "default",
+            "descriptors": [
+                {
+                    "key": "users",
+                    "value": "alice",
+                    "rate_limit": { "algorithm": "fixed_window", "unit": "seconds", "requests_per_unit": 10 }
+                }
+            ]
+        }"#;
+        let raw: crate::config_source::RawRateLimitsConfig =
+            serde_json::from_str(json_str).unwrap();
+        let compiled = crate::config_source::compile_rate_limits(raw).unwrap();
+        let (_tx, rx) = tokio::sync::watch::channel(compiled);
+
+        // Use a client pointing to an unreachable port to guarantee connection error
+        let client = redis::Client::open("redis://127.0.0.1:1").unwrap();
+        let pool = r2d2::Pool::builder()
+            .connection_timeout(std::time::Duration::from_millis(50))
+            .build_unchecked(client);
+
+        let steward = super::Steward {
+            config_rx: rx,
+            redis_pool: pool,
+            default_ttl: 10,
+            metrics: std::sync::Arc::new(cadence::StatsdClient::from_sink(
+                "",
+                cadence::NopMetricSink,
+            )),
+        };
+
+        use crate::proto::envoy::extensions::common::ratelimit::v3::{
+            RateLimitDescriptor, rate_limit_descriptor::Entry,
+        };
+        use crate::proto::envoy::service::ratelimit::v3::RateLimitRequest;
+        use crate::proto::envoy::service::ratelimit::v3::rate_limit_service_server::RateLimitService;
+
+        let req = RateLimitRequest {
+            domain: "default".to_string(),
+            descriptors: vec![RateLimitDescriptor {
+                entries: vec![Entry {
+                    key: "users".to_string(),
+                    value: "alice".to_string(),
+                }],
+                limit: None,
+                hits_addend: Some(1),
+                is_negative_hits: false,
+            }],
+            hits_addend: 0,
+        };
+
+        let err = steward
+            .should_rate_limit(tonic::Request::new(req))
+            .await
+            .expect_err("should return gRPC error when backend is unavailable");
+
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+        assert_eq!(err.message(), "rate limit storage backend is unavailable");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn definitive_denial_precedence_when_rule1_over_limit_and_rule2_redis_error() {
+        let Some(server) = TestRedisServer::start() else {
+            eprintln!("Skipping test: redis-server not available");
+            return;
+        };
+
+        let client = redis::Client::open(format!("redis://127.0.0.1:{}", server.port)).unwrap();
+        let pool = r2d2::Pool::builder().build(client.clone()).unwrap();
+        let json_str = r#"{
+            "domain": "default",
+            "descriptors": [
+                {
+                    "key": "tier",
+                    "value": "premium",
+                    "rate_limit": { "algorithm": "fixed_window", "unit": "seconds", "requests_per_unit": 5 }
+                },
+                {
+                    "key": "tier",
+                    "value": "standard",
+                    "rate_limit": { "algorithm": "fixed_window", "unit": "seconds", "requests_per_unit": 5 }
+                }
+            ]
+        }"#;
+        let raw: crate::config_source::RawRateLimitsConfig =
+            serde_json::from_str(json_str).unwrap();
+        let compiled = crate::config_source::compile_rate_limits(raw).unwrap();
+        let (_tx, rx) = tokio::sync::watch::channel(compiled);
+        let steward = super::Steward {
+            config_rx: rx,
+            redis_pool: pool,
+            default_ttl: 10,
+            metrics: std::sync::Arc::new(cadence::StatsdClient::from_sink(
+                "",
+                cadence::NopMetricSink,
+            )),
+        };
+
+        let mut conn = client.get_connection().unwrap();
+
+        // 1. Prime rule 1 (tier=premium) so it exceeds the limit (SET to 5, next hit will be 6 > 5 -> OVER_LIMIT)
+        let domain_policy = steward.config_rx.borrow().get("default").unwrap().clone();
+        let premium_match = domain_policy.match_entries(&[("tier", "premium")]).unwrap();
+        let premium_limit = premium_match.rate_limits[0];
+        let premium_path = encode_canonical_path([("tier", "premium")]);
+        let premium_key = rate_limit_key(
+            "default",
+            premium_match.policy_id,
+            &premium_path,
+            &premium_limit,
+            10,
+        );
+        let _: () = redis::cmd("SET")
+            .arg(&premium_key)
+            .arg(5)
+            .query(&mut conn)
+            .unwrap();
+
+        // 2. Corrupt rule 2 (tier=standard) key by creating a Hash at this key, so INCRBY in fixed_window.lua throws WRONGTYPE error
+        let standard_match = domain_policy
+            .match_entries(&[("tier", "standard")])
+            .unwrap();
+        let standard_limit = standard_match.rate_limits[0];
+        let standard_path = encode_canonical_path([("tier", "standard")]);
+        let standard_key = rate_limit_key(
+            "default",
+            standard_match.policy_id,
+            &standard_path,
+            &standard_limit,
+            10,
+        );
+        let _: () = redis::cmd("HSET")
+            .arg(&standard_key)
+            .arg("corrupt_field")
+            .arg("corrupt_val")
+            .query(&mut conn)
+            .unwrap();
+
+        use crate::proto::envoy::extensions::common::ratelimit::v3::{
+            RateLimitDescriptor, rate_limit_descriptor::Entry,
+        };
+        use crate::proto::envoy::service::ratelimit::v3::RateLimitRequest;
+        use crate::proto::envoy::service::ratelimit::v3::rate_limit_service_server::RateLimitService;
+
+        // Request with both descriptors: Rule 1 evaluates to OVER_LIMIT, Rule 2 triggers Redis WRONGTYPE error
+        let req = RateLimitRequest {
+            domain: "default".to_string(),
+            descriptors: vec![
+                RateLimitDescriptor {
+                    entries: vec![Entry {
+                        key: "tier".to_string(),
+                        value: "premium".to_string(),
+                    }],
+                    limit: None,
+                    hits_addend: Some(1),
+                    is_negative_hits: false,
+                },
+                RateLimitDescriptor {
+                    entries: vec![Entry {
+                        key: "tier".to_string(),
+                        value: "standard".to_string(),
+                    }],
+                    limit: None,
+                    hits_addend: Some(1),
+                    is_negative_hits: false,
+                },
+            ],
+            hits_addend: 0,
+        };
+
+        let resp = steward
+            .should_rate_limit(tonic::Request::new(req))
+            .await
+            .expect("Rule 1 OVER_LIMIT must take precedence over Rule 2 Redis error and return OK response")
+            .into_inner();
+
+        // F06 Rule 1: Definitive denial WINS!
+        assert_eq!(resp.overall_code, Code::OverLimit as i32);
+        assert_eq!(resp.statuses.len(), 2);
+        assert_eq!(resp.statuses[0].code, Code::OverLimit as i32);
+        assert_eq!(resp.statuses[0].limit_remaining, 0);
+
+        // Clean up
+        let _: () = redis::cmd("DEL")
+            .arg(&premium_key)
+            .arg(&standard_key)
+            .query(&mut conn)
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unmatched_descriptors_populate_unconstrained_status_code_ok_limit_none() {
+        let Some(server) = TestRedisServer::start() else {
+            eprintln!("Skipping test: redis-server not available");
+            return;
+        };
+
+        let client = redis::Client::open(format!("redis://127.0.0.1:{}", server.port)).unwrap();
+        let pool = r2d2::Pool::builder().build(client).unwrap();
+        let json_str = r#"{
+            "domain": "default",
+            "descriptors": [
+                {
+                    "key": "known_key",
+                    "value": "known_val",
+                    "rate_limit": { "algorithm": "fixed_window", "unit": "seconds", "requests_per_unit": 10 }
+                }
+            ]
+        }"#;
+        let raw: crate::config_source::RawRateLimitsConfig =
+            serde_json::from_str(json_str).unwrap();
+        let compiled = crate::config_source::compile_rate_limits(raw).unwrap();
+        let (_tx, rx) = tokio::sync::watch::channel(compiled);
+        let steward = super::Steward {
+            config_rx: rx,
+            redis_pool: pool,
+            default_ttl: 10,
+            metrics: std::sync::Arc::new(cadence::StatsdClient::from_sink(
+                "",
+                cadence::NopMetricSink,
+            )),
+        };
+
+        use crate::proto::envoy::extensions::common::ratelimit::v3::{
+            RateLimitDescriptor, rate_limit_descriptor::Entry,
+        };
+        use crate::proto::envoy::service::ratelimit::v3::RateLimitRequest;
+        use crate::proto::envoy::service::ratelimit::v3::rate_limit_service_server::RateLimitService;
+
+        let req = RateLimitRequest {
+            domain: "default".to_string(),
+            descriptors: vec![
+                RateLimitDescriptor {
+                    entries: vec![Entry {
+                        key: "known_key".to_string(),
+                        value: "known_val".to_string(),
+                    }],
+                    limit: None,
+                    hits_addend: Some(1),
+                    is_negative_hits: false,
+                },
+                RateLimitDescriptor {
+                    entries: vec![Entry {
+                        key: "unknown_key".to_string(),
+                        value: "unknown_val".to_string(),
+                    }],
+                    limit: None,
+                    hits_addend: Some(1),
+                    is_negative_hits: false,
+                },
+            ],
+            hits_addend: 0,
+        };
+
+        let resp = steward
+            .should_rate_limit(tonic::Request::new(req))
+            .await
+            .expect("request should succeed")
+            .into_inner();
+
+        assert_eq!(resp.overall_code, Code::Ok as i32);
+        assert_eq!(resp.statuses.len(), 2);
+
+        // Matched descriptor
+        assert_eq!(resp.statuses[0].code, Code::Ok as i32);
+        assert!(resp.statuses[0].current_limit.is_some());
+
+        // Unmatched descriptor: Code::Ok, limit = None, limit_remaining = 0, duration_until_reset = None
+        assert_eq!(resp.statuses[1].code, Code::Ok as i32);
+        assert_eq!(resp.statuses[1].current_limit, None);
+        assert_eq!(resp.statuses[1].limit_remaining, 0);
+        assert_eq!(resp.statuses[1].duration_until_reset, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unconfigured_domain_returns_unconstrained_status_for_all_descriptors() {
+        let json_str = r#"{
+            "domain": "configured_domain",
+            "descriptors": [
+                {
+                    "key": "k",
+                    "value": "v",
+                    "rate_limit": { "algorithm": "fixed_window", "unit": "seconds", "requests_per_unit": 10 }
+                }
+            ]
+        }"#;
+        let raw: crate::config_source::RawRateLimitsConfig =
+            serde_json::from_str(json_str).unwrap();
+        let compiled = crate::config_source::compile_rate_limits(raw).unwrap();
+        let (_tx, rx) = tokio::sync::watch::channel(compiled);
+        let steward = super::Steward::for_test(rx);
+
+        use crate::proto::envoy::extensions::common::ratelimit::v3::{
+            RateLimitDescriptor, rate_limit_descriptor::Entry,
+        };
+        use crate::proto::envoy::service::ratelimit::v3::RateLimitRequest;
+        use crate::proto::envoy::service::ratelimit::v3::rate_limit_service_server::RateLimitService;
+
+        let req = RateLimitRequest {
+            domain: "unconfigured_domain".to_string(),
+            descriptors: vec![
+                RateLimitDescriptor {
+                    entries: vec![Entry {
+                        key: "k1".to_string(),
+                        value: "v1".to_string(),
+                    }],
+                    limit: None,
+                    hits_addend: None,
+                    is_negative_hits: false,
+                },
+                RateLimitDescriptor {
+                    entries: vec![Entry {
+                        key: "k2".to_string(),
+                        value: "v2".to_string(),
+                    }],
+                    limit: None,
+                    hits_addend: None,
+                    is_negative_hits: false,
+                },
+            ],
+            hits_addend: 0,
+        };
+
+        let resp = steward
+            .should_rate_limit(tonic::Request::new(req))
+            .await
+            .expect("unconfigured domain allows traffic")
+            .into_inner();
+
+        assert_eq!(resp.overall_code, Code::Ok as i32);
+        assert_eq!(resp.statuses.len(), 2);
+        for status in &resp.statuses {
+            assert_eq!(status.code, Code::Ok as i32);
+            assert_eq!(status.current_limit, None);
+            assert_eq!(status.limit_remaining, 0);
+            assert_eq!(status.duration_until_reset, None);
+        }
+    }
+
+    #[test]
+    fn test_is_redis_timeout_classification() {
+        use super::is_redis_timeout;
+
+        let timeout_err = redis::RedisError::from((redis::ErrorKind::Io, "operation timed out"));
+        assert!(is_redis_timeout(&timeout_err));
+
+        let query_timeout_err =
+            redis::RedisError::from((redis::ErrorKind::Io, "command timed out"));
+        assert!(is_redis_timeout(&query_timeout_err));
+
+        // Pool connection acquisition failure (e.g. Redis unreachable or stopped) is classified
+        // as a backend connection error (Unavailable), not a timeout.
+        let pool_conn_err = redis::RedisError::from((
+            redis::ErrorKind::Io,
+            "failed to acquire Redis connection",
+            "timed out waiting to open a connection".to_string(),
+        ));
+        assert!(!is_redis_timeout(&pool_conn_err));
+
+        let conn_refused = redis::RedisError::from((
+            redis::ErrorKind::Io,
+            "failed to acquire Redis connection",
+            "connection refused".to_string(),
+        ));
+        assert!(!is_redis_timeout(&conn_refused));
+
+        let client_err = redis::RedisError::from((
+            redis::ErrorKind::Client,
+            "WRONGTYPE Operation against a key holding the wrong kind of value",
+        ));
+        assert!(!is_redis_timeout(&client_err));
     }
 }
