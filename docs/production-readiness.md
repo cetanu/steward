@@ -369,7 +369,7 @@ Milestones are dependency ordered. Each should leave a deployable development pr
 - [x] **M3.4:** Reuse/bound the configuration client, add refresh jitter and loader-health metrics, and document stale-policy/version-divergence behavior. Add conditional HTTP refresh if the chosen source supports it.
 - [x] **M3.5:** Declare managed Redis HA, memory/eviction/persistence policy, capacity headroom, supported failover behavior, and quota-state loss. Run restart/failover/cache-loss/memory-pressure exercises.
 - [x] **M3.6:** Provide the deployment's explicit Envoy timeout/failure policy and cluster connection/request circuit breakers; verify traffic distribution across multiple RLS replicas under persistent HTTP/2 connections.
-- [ ] **M3.7:** Publish SLO dashboards, alerts, and runbooks for overload, bypasses, stale config, Redis errors/memory, failover, rollout, and policy rollback.
+- [x] **M3.7:** Publish SLO dashboards, alerts, and runbooks for overload, bypasses, stale config, Redis errors/memory, failover, rollout, and policy rollback.
 
 **Exit evidence:** The actual production artifact can start, enforce, fail predictably, recover, and drain under authenticated traffic. Operators can detect and act on loss of enforcement.
 

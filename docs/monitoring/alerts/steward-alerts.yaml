@@ -1,0 +1,262 @@
+# Prometheus Alerting Rules for Steward Rate-Limit Service
+# Compliant with Prometheus Operator / Alertmanager / VictoriaMetrics
+
+groups:
+  - name: steward_slo_alerts
+    rules:
+      # -----------------------------------------------------------------------
+      # 1. Enforcement Availability SLO Burn Rate Alerts (99.99% Target)
+      # -----------------------------------------------------------------------
+      - alert: StewardEnforcementSLOHighBurnRate
+        expr: |
+          (
+            (
+              sum(rate(rate_limit_error_total[1h])) +
+              sum(rate(requests_rejected_admission_total[1h])) +
+              sum(rate(requests_deadline_exceeded_total[1h]))
+            )
+            /
+            (
+              sum(rate(rate_limit_allowed_total[1h])) +
+              sum(rate(rate_limit_denied_total[1h])) +
+              sum(rate(rate_limit_error_total[1h])) +
+              sum(rate(requests_rejected_admission_total[1h])) + 0.001
+            )
+          ) / 0.0001 > 14.4
+          and
+          (
+            (
+              sum(rate(rate_limit_error_total[5m])) +
+              sum(rate(requests_rejected_admission_total[5m])) +
+              sum(rate(requests_deadline_exceeded_total[5m]))
+            )
+            /
+            (
+              sum(rate(rate_limit_allowed_total[5m])) +
+              sum(rate(rate_limit_denied_total[5m])) +
+              sum(rate(rate_limit_error_total[5m])) +
+              sum(rate(requests_rejected_admission_total[5m])) + 0.001
+            )
+          ) / 0.0001 > 14.4
+        for: 2m
+        labels:
+          severity: critical
+          tier: service
+          slo: availability
+        annotations:
+          summary: "Steward Enforcement Availability SLO burning at 14.4x (2% budget consumed in 1h)"
+          description: "Steward is experiencing elevated error/shed rates: error budget is burning rapidly across both 1h and 5m observation windows."
+          runbook_url: "docs/runbooks/latency-and-deadlines.md"
+
+      - alert: StewardEnforcementSLOSlowBurnRate
+        expr: |
+          (
+            (
+              sum(rate(rate_limit_error_total[6h])) +
+              sum(rate(requests_rejected_admission_total[6h])) +
+              sum(rate(requests_deadline_exceeded_total[6h]))
+            )
+            /
+            (
+              sum(rate(rate_limit_allowed_total[6h])) +
+              sum(rate(rate_limit_denied_total[6h])) +
+              sum(rate(rate_limit_error_total[6h])) +
+              sum(rate(requests_rejected_admission_total[6h])) + 0.001
+            )
+          ) / 0.0001 > 6.0
+          and
+          (
+            (
+              sum(rate(rate_limit_error_total[30m])) +
+              sum(rate(requests_rejected_admission_total[30m])) +
+              sum(rate(requests_deadline_exceeded_total[30m]))
+            )
+            /
+            (
+              sum(rate(rate_limit_allowed_total[30m])) +
+              sum(rate(rate_limit_denied_total[30m])) +
+              sum(rate(rate_limit_error_total[30m])) +
+              sum(rate(requests_rejected_admission_total[30m])) + 0.001
+            )
+          ) / 0.0001 > 6.0
+        for: 15m
+        labels:
+          severity: warning
+          tier: service
+          slo: availability
+        annotations:
+          summary: "Steward Enforcement Availability SLO burning at 6x (5% budget consumed in 6h)"
+          description: "Steward error budget is steadily depleting over a 6-hour window. Investigate backend Redis degradation or admission drops."
+          runbook_url: "docs/runbooks/latency-and-deadlines.md"
+
+      # -----------------------------------------------------------------------
+      # 2. Decision Latency & Deadline Violations
+      # -----------------------------------------------------------------------
+      - alert: StewardHighDecisionLatencyP99
+        expr: |
+          histogram_quantile(0.99, sum(rate(request_duration_ms_bucket[5m])) by (le)) > 5.0
+        for: 5m
+        labels:
+          severity: warning
+          tier: performance
+        annotations:
+          summary: "Steward p99 decision latency exceeds SLO budget (5.0 ms)"
+          description: "Steward p99 decision latency is {{ $value | printf \"%.2f\" }} ms over the last 5 minutes. Check Redis command execution latency."
+          runbook_url: "docs/runbooks/latency-and-deadlines.md"
+
+      - alert: StewardCriticalDecisionLatencyP99
+        expr: |
+          histogram_quantile(0.99, sum(rate(request_duration_ms_bucket[2m])) by (le)) > 10.0
+        for: 2m
+        labels:
+          severity: critical
+          tier: performance
+        annotations:
+          summary: "Steward p99 decision latency exceeds 10.0 ms (Envoy timeout hazard)"
+          description: "Steward p99 decision latency is {{ $value | printf \"%.2f\" }} ms, approaching the 20ms Envoy RPC timeout threshold."
+          runbook_url: "docs/runbooks/latency-and-deadlines.md"
+
+      - alert: StewardRequestDeadlinesExceeded
+        expr: |
+          sum(rate(requests_deadline_exceeded_total[5m])) > 1.0
+        for: 2m
+        labels:
+          severity: critical
+          tier: service
+        annotations:
+          summary: "Steward requests exceeding internal 10ms execution deadline"
+          description: "Steward is dropping {{ $value | printf \"%.2f\" }} req/sec due to execution deadline expiration. Check Redis saturation or network partitions."
+          runbook_url: "docs/runbooks/latency-and-deadlines.md"
+
+      # -----------------------------------------------------------------------
+      # 3. Admission Control & Overload Protection
+      # -----------------------------------------------------------------------
+      - alert: StewardAdmissionLoadSheddingActive
+        expr: |
+          sum(rate(requests_rejected_admission_total[2m])) > 0
+        for: 1m
+        labels:
+          severity: critical
+          tier: service
+        annotations:
+          summary: "Steward global admission load shedding active (semaphore exhausted)"
+          description: "Steward is actively shedding load (HTTP 429 / gRPC ResourceExhausted). In-flight concurrency has exceeded the 1,024 permit threshold."
+          runbook_url: "docs/runbooks/latency-and-deadlines.md"
+
+      - alert: StewardInFlightConcurrencyHigh
+        expr: |
+          max(requests_in_flight) > 800
+        for: 2m
+        labels:
+          severity: warning
+          tier: capacity
+        annotations:
+          summary: "Steward in-flight concurrency approaching admission ceiling (> 800 / 1024 permits)"
+          description: "One or more Steward instances have {{ $value }} concurrent in-flight requests. Concurrency is nearing the 1,024 load-shedding limit."
+          runbook_url: "docs/runbooks/latency-and-deadlines.md"
+
+      # -----------------------------------------------------------------------
+      # 4. Configuration Freshness & Loader Health
+      # -----------------------------------------------------------------------
+      - alert: StewardConfigurationStaleCritical
+        expr: |
+          max(config_stale) == 1
+        for: 5m
+        labels:
+          severity: critical
+          tier: config
+        annotations:
+          summary: "Steward active configuration exceeds maximum stale duration (3600s)"
+          description: "Steward replica fleet is serving rate-limit policies older than 1 hour. Upstream configuration distribution is failing."
+          runbook_url: "docs/runbooks/stale-config-and-rollback.md"
+
+      - alert: StewardConfigurationReloadFailures
+        expr: |
+          max(config_consecutive_fetch_failures) >= 5
+        for: 10m
+        labels:
+          severity: warning
+          tier: config
+        annotations:
+          summary: "Steward background configuration loader failing consecutively"
+          description: "Steward has encountered {{ $value }} consecutive reload failures. Active policy snapshot is retained without dropping traffic."
+          runbook_url: "docs/runbooks/stale-config-and-rollback.md"
+
+      - alert: StewardConfigurationFleetVersionDivergence
+        expr: |
+          count by (cluster) (count by (cluster, config_version) (config_version)) > 1
+        for: 15m
+        labels:
+          severity: warning
+          tier: config
+        annotations:
+          summary: "Steward fleet configuration version divergence detected across replicas"
+          description: "Multiple configuration versions are actively serving traffic across Steward replicas for > 15m. Check deployment or reload logs."
+          runbook_url: "docs/runbooks/stale-config-and-rollback.md"
+
+      - alert: StewardConfigurationLoaderCrash
+        expr: |
+          sum(rate(config_loader_crashes_total[5m])) > 0
+        for: 1m
+        labels:
+          severity: critical
+          tier: config
+        annotations:
+          summary: "Steward configuration loader supervisor caught worker crash"
+          description: "The background configuration loader task panicked or crashed and was restarted by the supervisor."
+          runbook_url: "docs/runbooks/stale-config-and-rollback.md"
+
+      # -----------------------------------------------------------------------
+      # 5. Redis Storage Backend & Replication
+      # -----------------------------------------------------------------------
+      - alert: StewardRedisErrorRateElevated
+        expr: |
+          (
+            sum(rate(redis_errors_total[5m]))
+            /
+            (sum(rate(rate_limit_observed_total[5m])) + 0.001)
+          ) > 0.001
+        for: 2m
+        labels:
+          severity: critical
+          tier: storage
+        annotations:
+          summary: "Steward Redis backend error rate > 0.1%"
+          description: "Steward is experiencing elevated Redis storage errors ({{ $value | printf \"%.3f\" }}%). F06 error precedence is returning Unavailable to Envoy."
+          runbook_url: "docs/runbooks/redis-failover-and-oom.md"
+
+      - alert: StewardRedisMemorySaturationWarning
+        expr: |
+          (redis_memory_used_bytes / redis_memory_max_bytes) >= 0.75
+        for: 5m
+        labels:
+          severity: warning
+          tier: storage
+        annotations:
+          summary: "Redis used memory >= 75% of maxmemory"
+          description: "Redis memory utilization has reached {{ $value | printf \"%.1f\" }}% of maxmemory. Under noeviction, reaching 100% will trigger OOM write rejections."
+          runbook_url: "docs/runbooks/redis-failover-and-oom.md"
+
+      - alert: StewardRedisMemorySaturationCritical
+        expr: |
+          (redis_memory_used_bytes / redis_memory_max_bytes) >= 0.85
+        for: 2m
+        labels:
+          severity: critical
+          tier: storage
+        annotations:
+          summary: "Redis used memory >= 85% of maxmemory (OOM imminent)"
+          description: "Redis memory utilization is at {{ $value | printf \"%.1f\" }}%. Scale up instance memory or prune policy cardinality immediately."
+          runbook_url: "docs/runbooks/redis-failover-and-oom.md"
+
+      - alert: StewardRedisReplicaDisconnected
+        expr: |
+          redis_connected_slaves < 1
+        for: 3m
+        labels:
+          severity: warning
+          tier: storage
+        annotations:
+          summary: "Redis primary has 0 connected standby replicas"
+          description: "Redis primary is operating without a standby replica in the availability zone. Unplanned primary failure will cause downtime."
+          runbook_url: "docs/runbooks/redis-failover-and-oom.md"
