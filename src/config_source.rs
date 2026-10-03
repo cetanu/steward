@@ -265,19 +265,83 @@ pub fn compile_rate_limits_at(
     )))
 }
 
+pub const MAX_CONFIG_PAYLOAD_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
+pub const DEFAULT_MAX_STALE_DURATION_SECS: u64 = 3600; // 1 hour
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct HttpFetchMetadata {
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigFetchResult {
+    /// Newly parsed and validated configuration snapshot
+    Modified(Arc<CompiledConfig>),
+    /// Server returned 304 Not Modified; configuration is unchanged
+    NotModified,
+}
+
+pub fn calculate_jittered_interval(base: Duration) -> Duration {
+    let base_millis = base.as_millis() as u64;
+    if base_millis <= 1 {
+        return base;
+    }
+    // +/- 20% jitter: range is [base * 0.80, base * 1.20]
+    let mut buf = [0u8; 8];
+    let rng = aws_lc_rs::rand::SystemRandom::new();
+    if aws_lc_rs::rand::SecureRandom::fill(&rng, &mut buf).is_err() {
+        return base;
+    }
+    let rand_u64 = u64::from_le_bytes(buf);
+    let span = (base_millis as f64) * 0.40;
+    let min_millis = (base_millis as f64) * 0.80;
+    let fraction = (rand_u64 as f64) / (u64::MAX as f64);
+    let jittered_millis = (min_millis + span * fraction).round().max(1.0) as u64;
+    Duration::from_millis(jittered_millis)
+}
+
 pub async fn load_rate_limits(source: &ConfigSource) -> Result<Arc<CompiledConfig>, String> {
-    match source {
-        ConfigSource::File(path) => load_file_config(path),
-        ConfigSource::Http(url) => {
-            let url = url
-                .parse()
-                .map_err(|error| format!("invalid config URL: {error}"))?;
-            get_http_config(url).await
+    let mut metadata = HttpFetchMetadata::default();
+    match load_rate_limits_with_client(source, None, &mut metadata).await? {
+        ConfigFetchResult::Modified(config) => Ok(config),
+        ConfigFetchResult::NotModified => {
+            Err("unexpected 304 Not Modified on initial configuration load".to_string())
         }
     }
 }
 
-fn load_file_config(path: &str) -> Result<Arc<CompiledConfig>, String> {
+pub async fn load_rate_limits_with_client(
+    source: &ConfigSource,
+    http_client: Option<&reqwest::Client>,
+    http_metadata: &mut HttpFetchMetadata,
+) -> Result<ConfigFetchResult, String> {
+    match source {
+        ConfigSource::File(path) => {
+            let config = load_file_config_async(path.clone()).await?;
+            Ok(ConfigFetchResult::Modified(config))
+        }
+        ConfigSource::Http(url) => {
+            let parsed_url = url
+                .parse()
+                .map_err(|error| format!("invalid config URL: {error}"))?;
+            if let Some(client) = http_client {
+                fetch_http_config(client, &parsed_url, http_metadata).await
+            } else {
+                let client = create_http_client()?;
+                fetch_http_config(&client, &parsed_url, http_metadata).await
+            }
+        }
+    }
+}
+
+pub async fn load_file_config_async(path: String) -> Result<Arc<CompiledConfig>, String> {
+    tokio::task::spawn_blocking(move || load_file_config(&path))
+        .await
+        .map_err(|e| format!("config file loader task panicked or failed: {e}"))?
+}
+
+pub fn load_file_config(path: &str) -> Result<Arc<CompiledConfig>, String> {
     let raw: RawRateLimitsConfig = Config::builder()
         .add_source(File::with_name(path))
         .build()
@@ -287,24 +351,306 @@ fn load_file_config(path: &str) -> Result<Arc<CompiledConfig>, String> {
     compile_rate_limits(raw)
 }
 
-pub async fn get_http_config(url: Url) -> Result<Arc<CompiledConfig>, String> {
-    let client = reqwest::Client::builder()
+pub fn create_http_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
-        .map_err(|error| format!("failed to create config HTTP client: {error}"))?;
-    let response = client
-        .get(url)
+        .map_err(|error| format!("failed to create config HTTP client: {error}"))
+}
+
+pub async fn fetch_http_config(
+    client: &reqwest::Client,
+    url: &Url,
+    metadata: &mut HttpFetchMetadata,
+) -> Result<ConfigFetchResult, String> {
+    let mut req = client.get(url.clone());
+    if let Some(ref etag) = metadata.etag {
+        req = req.header(reqwest::header::IF_NONE_MATCH, etag);
+    }
+    if let Some(ref last_mod) = metadata.last_modified {
+        req = req.header(reqwest::header::IF_MODIFIED_SINCE, last_mod);
+    }
+
+    let response = req
         .send()
         .await
-        .map_err(|error| format!("request failed: {error}"))?
+        .map_err(|error| format!("config request failed: {error}"))?;
+
+    if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+        return Ok(ConfigFetchResult::NotModified);
+    }
+
+    let response = response
         .error_for_status()
         .map_err(|error| format!("config endpoint returned an error: {error}"))?;
 
-    let raw: RawRateLimitsConfig = response
-        .json()
+    let new_etag = response
+        .headers()
+        .get(reqwest::header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let new_last_mod = response
+        .headers()
+        .get(reqwest::header::LAST_MODIFIED)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    if let Some(content_length) = response.content_length() {
+        if content_length > MAX_CONFIG_PAYLOAD_BYTES as u64 {
+            return Err(format!(
+                "config response Content-Length ({content_length} bytes) exceeds maximum allowed limit ({MAX_CONFIG_PAYLOAD_BYTES} bytes)"
+            ));
+        }
+    }
+
+    let mut body_bytes = Vec::new();
+    let mut response = response;
+    while let Some(chunk) = response
+        .chunk()
         .await
+        .map_err(|error| format!("failed reading config response chunk: {error}"))?
+    {
+        if body_bytes.len() + chunk.len() > MAX_CONFIG_PAYLOAD_BYTES {
+            return Err(format!(
+                "config response payload exceeded maximum allowed limit of {MAX_CONFIG_PAYLOAD_BYTES} bytes"
+            ));
+        }
+        body_bytes.extend_from_slice(&chunk);
+    }
+
+    let raw: RawRateLimitsConfig = serde_json::from_slice(&body_bytes)
         .map_err(|error| format!("invalid rate-limit config response: {error}"))?;
-    compile_rate_limits(raw)
+    let compiled = compile_rate_limits(raw)?;
+
+    metadata.etag = new_etag;
+    metadata.last_modified = new_last_mod;
+
+    Ok(ConfigFetchResult::Modified(compiled))
+}
+
+pub async fn get_http_config(url: Url) -> Result<Arc<CompiledConfig>, String> {
+    let client = create_http_client()?;
+    let mut metadata = HttpFetchMetadata::default();
+    match fetch_http_config(&client, &url, &mut metadata).await? {
+        ConfigFetchResult::Modified(cfg) => Ok(cfg),
+        ConfigFetchResult::NotModified => {
+            Err("unexpected 304 Not Modified on initial configuration fetch".to_string())
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct LoaderState {
+    consecutive_failures: u64,
+    last_reload_timestamp: u64,
+    http_metadata: HttpFetchMetadata,
+}
+
+enum LoaderExitReason {
+    ChannelClosed,
+}
+
+struct WorkerGuard<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for WorkerGuard<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+async fn run_config_loader_loop(
+    source: ConfigSource,
+    refresh_interval: Duration,
+    max_stale_duration: Duration,
+    config_tx: tokio::sync::watch::Sender<Arc<CompiledConfig>>,
+    metrics: SharedMetrics,
+    http_client: Option<reqwest::Client>,
+    shared_state: Arc<tokio::sync::Mutex<LoaderState>>,
+) -> LoaderExitReason {
+    loop {
+        let jittered_duration = calculate_jittered_interval(refresh_interval);
+        tokio::time::sleep(jittered_duration).await;
+
+        if config_tx.is_closed() {
+            return LoaderExitReason::ChannelClosed;
+        }
+
+        let mut http_metadata = {
+            let state = shared_state.lock().await;
+            state.http_metadata.clone()
+        };
+
+        let fetch_result =
+            load_rate_limits_with_client(&source, http_client.as_ref(), &mut http_metadata).await;
+
+        let mut state = shared_state.lock().await;
+        match fetch_result {
+            Ok(ConfigFetchResult::Modified(new_config)) => {
+                state.http_metadata = http_metadata;
+                state.consecutive_failures = 0;
+                let now_epoch = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                state.last_reload_timestamp = now_epoch;
+
+                let domains = new_config.len();
+                let version_hash = new_config.version_hash.clone();
+                if config_tx.send(new_config).is_err() {
+                    return LoaderExitReason::ChannelClosed;
+                }
+                let version_num = {
+                    let prefix = &version_hash[..16.min(version_hash.len())];
+                    u64::from_str_radix(prefix, 16).unwrap_or(0)
+                };
+                count(&metrics, "config.reloads", 1);
+                gauge(&metrics, "config.version", version_num);
+                gauge(&metrics, "config.age_seconds", 0);
+                gauge(&metrics, "config.last_reload_timestamp", now_epoch);
+                gauge(&metrics, "config.consecutive_fetch_failures", 0);
+                gauge(&metrics, "config.stale", 0);
+                tracing::info!(domains, %version_hash, "reloaded rate-limit configuration");
+            }
+            Ok(ConfigFetchResult::NotModified) => {
+                state.consecutive_failures = 0;
+                let now_epoch = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                state.last_reload_timestamp = now_epoch;
+
+                count(&metrics, "config.not_modified", 1);
+                gauge(&metrics, "config.consecutive_fetch_failures", 0);
+                gauge(&metrics, "config.last_reload_timestamp", now_epoch);
+                let active_age = config_tx.borrow().age_seconds();
+                gauge(&metrics, "config.age_seconds", active_age);
+                let is_stale = if active_age > max_stale_duration.as_secs() {
+                    1
+                } else {
+                    0
+                };
+                gauge(&metrics, "config.stale", is_stale);
+                tracing::debug!(
+                    active_version = %config_tx.borrow().version_hash,
+                    active_age_seconds = active_age,
+                    "configuration unchanged (304 Not Modified)"
+                );
+            }
+            Err(error) => {
+                state.consecutive_failures += 1;
+                let failures = state.consecutive_failures;
+                count(&metrics, "config.reload_errors", 1);
+                count(&metrics, "config.errors", 1);
+                gauge(&metrics, "config.consecutive_fetch_failures", failures);
+                let active_age = config_tx.borrow().age_seconds();
+                gauge(&metrics, "config.age_seconds", active_age);
+                let is_stale = if active_age > max_stale_duration.as_secs() {
+                    1
+                } else {
+                    0
+                };
+                gauge(&metrics, "config.stale", is_stale);
+                if is_stale == 1 {
+                    tracing::error!(
+                        %error,
+                        active_version = %config_tx.borrow().version_hash,
+                        active_age_seconds = active_age,
+                        max_stale_duration_secs = max_stale_duration.as_secs(),
+                        consecutive_failures = failures,
+                        "CRITICAL: configuration reload failed and active snapshot exceeds maximum stale duration"
+                    );
+                } else {
+                    tracing::warn!(
+                        %error,
+                        active_version = %config_tx.borrow().version_hash,
+                        active_age_seconds = active_age,
+                        consecutive_failures = failures,
+                        "failed to reload rate-limit configuration; retaining active version"
+                    );
+                }
+            }
+        }
+    }
+}
+
+pub fn spawn_supervised_config_loader(
+    source: ConfigSource,
+    refresh_interval: Duration,
+    max_stale_duration: Duration,
+    config_tx: tokio::sync::watch::Sender<Arc<CompiledConfig>>,
+    metrics: SharedMetrics,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let initial_epoch = config_tx
+            .borrow()
+            .loaded_at
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let shared_state = Arc::new(tokio::sync::Mutex::new(LoaderState {
+            consecutive_failures: 0,
+            last_reload_timestamp: initial_epoch,
+            http_metadata: HttpFetchMetadata::default(),
+        }));
+
+        let http_client = match source {
+            ConfigSource::Http(_) => match create_http_client() {
+                Ok(client) => Some(client),
+                Err(err) => {
+                    tracing::error!(%err, "failed to initialize HTTP client for config loader");
+                    None
+                }
+            },
+            ConfigSource::File(_) => None,
+        };
+
+        loop {
+            if config_tx.is_closed() {
+                tracing::info!("config watch channel closed; terminating config loader supervisor");
+                break;
+            }
+
+            let source_clone = source.clone();
+            let config_tx_clone = config_tx.clone();
+            let metrics_clone = metrics.clone();
+            let client_clone = http_client.clone();
+            let shared_state_clone = shared_state.clone();
+
+            let worker = tokio::spawn(async move {
+                run_config_loader_loop(
+                    source_clone,
+                    refresh_interval,
+                    max_stale_duration,
+                    config_tx_clone,
+                    metrics_clone,
+                    client_clone,
+                    shared_state_clone,
+                )
+                .await
+            });
+
+            let mut guard = WorkerGuard(worker);
+            match (&mut guard.0).await {
+                Ok(LoaderExitReason::ChannelClosed) => {
+                    tracing::info!("config channel closed; supervisor exiting");
+                    break;
+                }
+                Err(join_err) => {
+                    if join_err.is_cancelled() {
+                        tracing::info!("config loader supervisor cancelled; terminating");
+                        break;
+                    }
+                    count(&metrics, "config.loader_crashes", 1);
+                    tracing::error!(
+                        error = %join_err,
+                        "config loader worker task panicked or failed; supervising restart in 1s"
+                    );
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+    })
 }
 
 pub fn spawn_config_loader(
@@ -313,40 +659,13 @@ pub fn spawn_config_loader(
     config_tx: tokio::sync::watch::Sender<Arc<CompiledConfig>>,
     metrics: SharedMetrics,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(refresh_interval).await;
-            match load_rate_limits(&source).await {
-                Ok(new_config) => {
-                    let domains = new_config.len();
-                    let version_hash = new_config.version_hash.clone();
-                    if config_tx.send(new_config).is_err() {
-                        break;
-                    }
-                    let version_num = {
-                        let prefix = &version_hash[..16.min(version_hash.len())];
-                        u64::from_str_radix(prefix, 16).unwrap_or(0)
-                    };
-                    count(&metrics, "config.reloads", 1);
-                    gauge(&metrics, "config.version", version_num);
-                    gauge(&metrics, "config.age_seconds", 0);
-                    tracing::info!(domains, %version_hash, "reloaded rate-limit configuration");
-                }
-                Err(error) => {
-                    count(&metrics, "config.reload_errors", 1);
-                    count(&metrics, "config.errors", 1);
-                    let active_age = config_tx.borrow().age_seconds();
-                    gauge(&metrics, "config.age_seconds", active_age);
-                    tracing::warn!(
-                        %error,
-                        active_version = %config_tx.borrow().version_hash,
-                        active_age_seconds = active_age,
-                        "failed to reload rate-limit configuration; retaining active version"
-                    );
-                }
-            }
-        }
-    })
+    spawn_supervised_config_loader(
+        source,
+        refresh_interval,
+        Duration::from_secs(DEFAULT_MAX_STALE_DURATION_SECS),
+        config_tx,
+        metrics,
+    )
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -376,6 +695,8 @@ pub struct Settings {
     pub default_ttl: usize,
     #[serde(default = "default_config_refresh_interval_secs")]
     pub config_refresh_interval_secs: u64,
+    #[serde(default = "default_max_stale_duration_secs")]
+    pub max_stale_duration_secs: u64,
     #[serde(default)]
     pub metrics: Option<MetricsConfig>,
     #[serde(default = "default_execution_timeout_ms")]
@@ -487,6 +808,10 @@ fn default_ttl() -> usize {
 
 fn default_config_refresh_interval_secs() -> u64 {
     60
+}
+
+fn default_max_stale_duration_secs() -> u64 {
+    DEFAULT_MAX_STALE_DURATION_SECS
 }
 
 fn default_statsd_prefix() -> String {
@@ -1044,6 +1369,7 @@ mod tests {
             redis_connections: Some(1),
             default_ttl: 10,
             config_refresh_interval_secs: 60,
+            max_stale_duration_secs: 3600,
             metrics: None,
             execution_timeout_ms: 10,
             max_concurrent_requests: 1024,
@@ -1104,5 +1430,237 @@ mod tests {
             std::env::remove_var("STEWARD_TLS_KEY");
             std::env::remove_var("STEWARD_TLS_CLIENT_CA");
         }
+    }
+
+    #[test]
+    fn calculate_jittered_interval_bounds_and_entropy() {
+        use super::calculate_jittered_interval;
+
+        let base = Duration::from_millis(1000);
+        let mut samples = Vec::new();
+        for _ in 0..100 {
+            let j = calculate_jittered_interval(base);
+            assert!(
+                j >= Duration::from_millis(800) && j <= Duration::from_millis(1200),
+                "jittered interval ({j:?}) out of expected 800ms-1200ms bounds"
+            );
+            samples.push(j.as_millis());
+        }
+
+        let min_val = samples.iter().copied().min().unwrap();
+        let max_val = samples.iter().copied().max().unwrap();
+        assert!(
+            max_val > min_val,
+            "jittered intervals must vary across calls (min={min_val}, max={max_val})"
+        );
+
+        // Edge case: zero or 1ms duration returns base without panic
+        assert_eq!(
+            calculate_jittered_interval(Duration::from_millis(0)),
+            Duration::from_millis(0)
+        );
+        assert_eq!(
+            calculate_jittered_interval(Duration::from_millis(1)),
+            Duration::from_millis(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn http_conditional_fetch_and_304_not_modified() {
+        use super::{ConfigFetchResult, HttpFetchMetadata, create_http_client, fetch_http_config};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let url: reqwest::Url = format!("http://127.0.0.1:{port}/config.json")
+            .parse()
+            .unwrap();
+
+        let server_handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let n = match socket.read(&mut buf).await {
+                        Ok(n) if n > 0 => n,
+                        _ => return,
+                    };
+                    let req_str = String::from_utf8_lossy(&buf[..n]).to_lowercase();
+                    if req_str.contains("if-none-match: \"etag-v1\"") {
+                        let resp = "HTTP/1.1 304 Not Modified\r\n\r\n";
+                        let _ = socket.write_all(resp.as_bytes()).await;
+                    } else {
+                        let body = r#"{"domain":"default","descriptors":[{"key":"k","value":"v","rate_limit":{"unit":"seconds","requests_per_unit":10}}]}"#;
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nETag: \"etag-v1\"\r\nLast-Modified: Sat, 03 Oct 2026 12:00:00 GMT\r\nContent-Length: {}\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = socket.write_all(resp.as_bytes()).await;
+                    }
+                });
+            }
+        });
+
+        let client = create_http_client().unwrap();
+        let mut metadata = HttpFetchMetadata::default();
+
+        // 1. Initial fetch: should return 200 OK with newly compiled config and populate ETag/Last-Modified
+        let res1 = fetch_http_config(&client, &url, &mut metadata)
+            .await
+            .unwrap();
+        match res1 {
+            ConfigFetchResult::Modified(config) => {
+                assert!(config.get("default").is_some());
+                assert_eq!(metadata.etag, Some("\"etag-v1\"".to_string()));
+                assert_eq!(
+                    metadata.last_modified,
+                    Some("Sat, 03 Oct 2026 12:00:00 GMT".to_string())
+                );
+            }
+            ConfigFetchResult::NotModified => panic!("initial fetch must not be 304"),
+        }
+
+        // 2. Subsequent conditional fetch: sending ETag should yield 304 Not Modified without re-parsing
+        let res2 = fetch_http_config(&client, &url, &mut metadata)
+            .await
+            .unwrap();
+        assert_eq!(res2, ConfigFetchResult::NotModified);
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn http_oversized_content_length_rejected() {
+        use super::{HttpFetchMetadata, create_http_client, fetch_http_config};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let url: reqwest::Url = format!("http://127.0.0.1:{port}/config.json")
+            .parse()
+            .unwrap();
+
+        let server_handle = tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 15728640\r\n\r\n{}";
+                let _ = socket.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let client = create_http_client().unwrap();
+        let mut metadata = HttpFetchMetadata::default();
+        let err = fetch_http_config(&client, &url, &mut metadata)
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("exceeds maximum allowed limit"),
+            "unexpected error message: {err}"
+        );
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn http_oversized_streaming_payload_rejected() {
+        use super::{HttpFetchMetadata, create_http_client, fetch_http_config};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let url: reqwest::Url = format!("http://127.0.0.1:{port}/config.json")
+            .parse()
+            .unwrap();
+
+        let server_handle = tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let _ = socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n")
+                    .await;
+                let chunk = [b' '; 64 * 1024]; // 64 KiB
+                for _ in 0..170 {
+                    // 170 * 64 KiB = ~10.8 MiB > 10 MiB limit
+                    if socket.write_all(&chunk).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+
+        let client = create_http_client().unwrap();
+        let mut metadata = HttpFetchMetadata::default();
+        let err = fetch_http_config(&client, &url, &mut metadata)
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("exceeded maximum allowed limit"),
+            "unexpected error message: {err}"
+        );
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn loader_health_metrics_consecutive_failures_and_staleness() {
+        use super::{ConfigSource, load_rate_limits, spawn_supervised_config_loader};
+
+        let temp_dir = std::env::temp_dir();
+        let file_path = temp_dir.join(format!(
+            "steward_loader_health_{}_{}.json",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let file_str = file_path.to_str().unwrap().to_string();
+
+        let valid_config = r#"{
+            "domain": "default",
+            "descriptors": [
+                {
+                    "key": "k",
+                    "value": "v",
+                    "rate_limit": { "unit": "seconds", "requests_per_unit": 10 }
+                }
+            ]
+        }"#;
+        std::fs::write(&file_path, valid_config).unwrap();
+
+        let config_source = ConfigSource::File(file_str.clone());
+        let initial_config = load_rate_limits(&config_source).await.unwrap();
+        let (tx, _rx) = tokio::sync::watch::channel(initial_config);
+        let metrics =
+            std::sync::Arc::new(cadence::StatsdClient::from_sink("", cadence::NopMetricSink));
+
+        // Spawn supervised loader with short refresh (30ms) and short max_stale_duration (1s)
+        let handle = spawn_supervised_config_loader(
+            config_source.clone(),
+            Duration::from_millis(30),
+            Duration::from_millis(50),
+            tx.clone(),
+            metrics.clone(),
+        );
+
+        // Break the file to trigger reload failures
+        std::fs::write(&file_path, "{ invalid: malformed json }").unwrap();
+
+        // Wait for multiple ticks and staleness threshold to pass
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Restore file to valid config
+        std::fs::write(&file_path, valid_config).unwrap();
+
+        // Wait for recovery tick
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        handle.abort();
+        let _ = std::fs::remove_file(&file_path);
     }
 }

@@ -8,7 +8,7 @@ use tonic::transport::Server;
 use tracing::info;
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
-use steward::config_source::{Settings, load_rate_limits, spawn_config_loader};
+use steward::config_source::{Settings, load_rate_limits, spawn_supervised_config_loader};
 use steward::metrics::build_metrics;
 use steward::proto::envoy::service::ratelimit::v3::rate_limit_service_server::RateLimitServiceServer;
 use steward::service::Steward;
@@ -46,12 +46,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     steward::metrics::gauge(&metrics, "config.version", initial_version_num);
     steward::metrics::gauge(&metrics, "config.age_seconds", 0);
+    let initial_epoch = initial_config
+        .loaded_at
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    steward::metrics::gauge(&metrics, "config.last_reload_timestamp", initial_epoch);
+    steward::metrics::gauge(&metrics, "config.consecutive_fetch_failures", 0);
+    steward::metrics::gauge(&metrics, "config.stale", 0);
 
     let (config_tx, config_rx) = watch::channel(initial_config);
 
-    let config_loader_handle = spawn_config_loader(
+    let config_loader_handle = spawn_supervised_config_loader(
         settings.rate_limit_configs.clone(),
         std::time::Duration::from_secs(settings.config_refresh_interval_secs.max(1)),
+        std::time::Duration::from_secs(settings.max_stale_duration_secs.max(1)),
         config_tx,
         metrics.clone(),
     );
