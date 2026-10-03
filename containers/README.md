@@ -8,7 +8,7 @@ This directory contains container build specifications for both release packagin
 
 The following files define standalone production container images:
 
-* **[`Dockerfile`](file:///home/vsyrakis/Documents/steward/containers/Dockerfile)**:
+* **[`Dockerfile`](Dockerfile)**:
   Multi-stage production build definition:
   - **Stage 1 (Builder):** Uses `rust:1.88-bookworm` to compile the release binary (`cargo build --release --locked --bin steward`).
   - **Stage 2 (Runtime):** Uses minimal `debian:bookworm-slim` with updated CA certificates.
@@ -16,7 +16,7 @@ The following files define standalone production container images:
   - **Independence:** Contains strictly the compiled `/project/steward` binary and OS certificates. It contains **no** baked-in policy files, mock hostnames, or test configurations.
   - **Operator Configuration:** Supply configuration via standard container volume mounts (e.g. at `/etc/steward/steward.yaml`) or via 12-factor environment variables (`STEWARD__*`, `REDIS_URL`).
 
-* **[`Dockerfile.prebuilt`](file:///home/vsyrakis/Documents/steward/containers/Dockerfile.prebuilt)**:
+* **[`Dockerfile.prebuilt`](Dockerfile.prebuilt)**:
   Packaging image used in CI to wrap pre-compiled CI runner binaries (`target/release/steward`) for Trivy vulnerability scanning and fast integration testing.
 
 ---
@@ -25,9 +25,9 @@ The following files define standalone production container images:
 
 The remaining files in this directory and `docker-compose.yml` are strictly for **local development and CI integration tests** within this repository:
 
-* **[`envoy.Dockerfile`](file:///home/vsyrakis/Documents/steward/containers/envoy.Dockerfile) & [`envoy.yaml`](file:///home/vsyrakis/Documents/steward/containers/envoy.yaml)**:
+* **[`envoy.Dockerfile`](envoy.Dockerfile) & [`envoy.yaml`](envoy.yaml)**:
   Configures an Envoy proxy (v1.39) as an RLS client to exercise circuit breaking, gRPC timeouts (20 ms), HTTP/2 load balancing across replicas, and rate-limit headers (`x-ratelimit-*`).
-* **[`mock_config.Dockerfile`](file:///home/vsyrakis/Documents/steward/containers/mock_config.Dockerfile) & [`mock_server.py`](file:///home/vsyrakis/Documents/steward/containers/mock_server.py)**:
+* **[`mock_config.Dockerfile`](mock_config.Dockerfile) & [`mock_server.py`](mock_server.py)**:
   A lightweight Python HTTP server used in integration tests to serve dynamic policy JSON configurations and verify HTTP conditional fetch (ETag / 304 Not Modified).
-* **[`steward.yaml`](file:///home/vsyrakis/Documents/steward/containers/steward.yaml)**:
+* **[`steward.yaml`](steward.yaml)**:
   Docker Compose testbed configuration pointing Steward to `http://mock_config:8000/api/rate_limits` and `redis_host: redis`. In `docker-compose.yml`, this file is mounted at `/project/steward.yaml:ro` for development containers.

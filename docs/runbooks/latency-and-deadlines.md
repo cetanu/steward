@@ -11,7 +11,7 @@
 
 ## 1. Overview & Architecture Context
 
-Steward operates on a strict latency budget ratified in [`docs/slo-and-limits.md`](file:///home/vsyrakis/Documents/steward/docs/slo-and-limits.md):
+Steward operates on a strict latency budget ratified in [`docs/slo-and-limits.md`](../slo-and-limits.md):
 - **Envoy RPC Timeout:** 20 ms.
 - **Steward Internal Execution Deadline:** 10 ms.
 - **Global Admission Semaphore:** 1,024 concurrent requests per instance.
@@ -47,7 +47,7 @@ In-flight permits exhausted     Check p99 latency
 ## 3. Immediate Diagnostic Steps
 
 ### Step 1: Identify Where the Time is Spent
-Open the **Steward / Service Level Objectives & Operations** Grafana dashboard ([`steward-slo`](file:///home/vsyrakis/Documents/steward/docs/monitoring/dashboards/steward-slo.json)):
+Open the **Steward / Service Level Objectives & Operations** Grafana dashboard ([`steward-slo`](../monitoring/dashboards/steward-slo.json)):
 1. Compare **Request Decision Latency** vs **Redis Backend Phase Latency**:
    - **If Redis Latency $\approx$ Total Latency:** The bottleneck is inside the Redis engine or the network RTT between Steward and Redis.
    - **If Total Latency $\gg$ Redis Latency:** The bottleneck is thread queuing, Tokio runtime exhaustion, or semaphore contention inside Steward.
