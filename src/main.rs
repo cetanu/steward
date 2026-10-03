@@ -1,16 +1,17 @@
 use socket2::{Domain, Socket, Type};
 use std::net::SocketAddr;
 
-use tokio::{net::TcpListener, sync::watch, time::sleep};
+use tokio::net::TcpListener;
+use tokio::sync::watch;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
-use tracing::{info, warn};
+use tracing::info;
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
-use steward::config_source::{ConfigSource, Settings, load_rate_limits};
-use steward::metrics::{SharedMetrics, build_metrics, count};
+use steward::config_source::{Settings, load_rate_limits, spawn_config_loader};
+use steward::metrics::build_metrics;
 use steward::proto::envoy::service::ratelimit::v3::rate_limit_service_server::RateLimitServiceServer;
-use steward::service::{RateLimitConfigs, Steward};
+use steward::service::Steward;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -27,7 +28,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let settings = Settings::new().map_err(|error| format!("could not load config: {error}"))?;
     let metrics = build_metrics(settings.metrics.as_ref())?;
-    let (config_tx, config_rx) = watch::channel(RateLimitConfigs::new());
+
+    info!("loading initial rate-limit configuration");
+    let initial_config = load_rate_limits(&settings.rate_limit_configs)
+        .await
+        .map_err(|error| format!("initial configuration load failed: {error}"))?;
+
+    info!(
+        domains = initial_config.len(),
+        version_hash = %initial_config.version_hash,
+        "initial rate-limit configuration loaded and validated successfully"
+    );
+
+    let (config_tx, config_rx) = watch::channel(initial_config);
 
     spawn_config_loader(
         settings.rate_limit_configs.clone(),
@@ -63,31 +76,4 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .serve_with_incoming(incoming)
         .await?;
     Ok(())
-}
-
-fn spawn_config_loader(
-    source: ConfigSource,
-    refresh_interval: std::time::Duration,
-    config_tx: watch::Sender<RateLimitConfigs>,
-    metrics: SharedMetrics,
-) {
-    tokio::spawn(async move {
-        loop {
-            match load_rate_limits(&source).await {
-                Ok(config) => {
-                    let domains = config.len();
-                    if config_tx.send(config).is_err() {
-                        break;
-                    }
-                    count(&metrics, "config.reloads", 1);
-                    info!(domains, "loaded rate-limit configuration");
-                }
-                Err(error) => {
-                    count(&metrics, "config.errors", 1);
-                    warn!(%error, "failed to load rate-limit configuration; retaining the previous version");
-                }
-            }
-            sleep(refresh_interval).await;
-        }
-    });
 }
