@@ -88,12 +88,12 @@ static_resources:
                   "@type": type.googleapis.com/envoy.extensions.filters.http.ratelimit.v3.RateLimit
                   domain: default
                   request_type: both # can be 'external|internal'
-                  failure_mode_deny: false
+                  failure_mode_deny: false # Ratified in docs/failure-policy.md: fail-open for availability; set true for fail-closed security
                   rate_limit_service:
                     grpc_service:
                       envoy_grpc:
                         cluster_name: rls
-                      timeout: 0.020s
+                      timeout: 0.020s # Explicit per-request RPC timeout (20ms as ratified in docs/slo-and-limits.md)
                     transport_api_version: V3
                   enable_x_ratelimit_headers: DRAFT_VERSION_03
               - name: envoy.filters.http.router
@@ -101,10 +101,35 @@ static_resources:
                   "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
   clusters:
     - name: rls
-      connect_timeout: 0.010s
+      connect_timeout: 0.020s
       type: STRICT_DNS
       lb_policy: ROUND_ROBIN
-      http2_protocol_options: {}
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options:
+              max_concurrent_streams: 1024
+              initial_stream_window_size: 65536 # 64 KiB
+              initial_connection_window_size: 1048576 # 1 MiB
+              connection_keepalive:
+                interval: 30s
+                timeout: 10s
+      max_requests_per_connection: 100000
+      circuit_breakers:
+        thresholds:
+          - priority: DEFAULT
+            max_connections: 1024
+            max_pending_requests: 1024
+            max_requests: 4096
+            max_retries: 3
+            track_remaining: true
+          - priority: HIGH
+            max_connections: 2048
+            max_pending_requests: 2048
+            max_requests: 8192
+            max_retries: 3
+            track_remaining: true
       load_assignment:
         cluster_name: rls
         endpoints:
@@ -113,6 +138,11 @@ static_resources:
                   address:
                     socket_address:
                       address: server
+                      port_value: 5001
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: server-replica-2
                       port_value: 5001
     - name: httpbin
       connect_timeout: 0.25s
