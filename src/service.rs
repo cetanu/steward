@@ -73,8 +73,8 @@ impl redis::FromRedisValue for ScriptOutcome {
 }
 
 pub fn generate_sliding_window_nonce() -> String {
-    use ring::rand::SecureRandom;
-    let rng = ring::rand::SystemRandom::new();
+    use aws_lc_rs::rand::SecureRandom;
+    let rng = aws_lc_rs::rand::SystemRandom::new();
     let mut bytes = [0u8; 16];
     rng.fill(&mut bytes)
         .expect("system randomness failed to generate nonce");
@@ -1713,7 +1713,7 @@ mod tests {
                 cadence::NopMetricSink,
             )),
             scripts: super::StewardScripts::default(),
-            execution_timeout: super::DEFAULT_EXECUTION_TIMEOUT,
+            execution_timeout: std::time::Duration::from_secs(5),
             admission_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 super::DEFAULT_MAX_CONCURRENT_REQUESTS,
             )),
