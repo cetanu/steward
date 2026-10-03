@@ -824,14 +824,61 @@ fn default_statsd_queue_capacity() -> usize {
 
 impl Settings {
     pub fn new() -> Result<Self, ConfigError> {
-        let config_path = env::var("STEWARD_CONFIG_PATH").unwrap_or_else(|_| "steward.yaml".into());
-
         let mut builder = Config::builder();
-        for path in config_path.split(',') {
-            builder = builder.add_source(File::with_name(path));
+        let mut file_configured = false;
+
+        if let Ok(config_paths) = env::var("STEWARD_CONFIG_PATH") {
+            for path in config_paths.split(',') {
+                let trimmed = path.trim();
+                if !trimmed.is_empty() {
+                    builder = builder.add_source(File::with_name(trimmed));
+                    file_configured = true;
+                }
+            }
+        } else {
+            let candidate_paths = [
+                "./steward.yaml",
+                "./steward.yml",
+                "/etc/steward/steward.yaml",
+                "/etc/steward/steward.yml",
+                "/etc/steward.yaml",
+                "/etc/steward.yml",
+            ];
+            for candidate in candidate_paths {
+                if std::path::Path::new(candidate).is_file() {
+                    builder = builder.add_source(File::with_name(candidate));
+                    file_configured = true;
+                    break;
+                }
+            }
         }
+
         builder = builder.add_source(Environment::with_prefix("STEWARD").separator("__"));
-        builder.build()?.try_deserialize()
+
+        let built_config = match builder.build() {
+            Ok(c) => c,
+            Err(e) => {
+                if !file_configured {
+                    return Err(ConfigError::Message(format!(
+                        "No configuration file found at STEWARD_CONFIG_PATH, ./steward.yaml, /etc/steward/steward.yaml, or /etc/steward.yaml, and environment variables were incomplete: {e}"
+                    )));
+                }
+                return Err(e);
+            }
+        };
+
+        match built_config.try_deserialize() {
+            Ok(settings) => Ok(settings),
+            Err(err) => {
+                if !file_configured {
+                    Err(ConfigError::Message(format!(
+                        "No configuration file found at STEWARD_CONFIG_PATH, ./steward.yaml, /etc/steward/steward.yaml, or /etc/steward.yaml, and environment variables were incomplete: {err}"
+                    )))
+                } else {
+                    Err(err)
+                }
+            }
+        }
     }
 
     pub fn redis_target(&self) -> String {
@@ -857,6 +904,8 @@ mod tests {
     };
     use crate::rate_limits::Unit;
     use std::time::{Duration, SystemTime};
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn parses_and_compiles_mock_server_format() {
@@ -1356,6 +1405,7 @@ mod tests {
 
     #[test]
     fn settings_redis_target_precedence() {
+        let _env_guard = ENV_LOCK.lock().unwrap();
         use super::{ConfigSource, ListenConfig, Settings};
 
         let mut settings = Settings {
@@ -1403,6 +1453,7 @@ mod tests {
 
     #[test]
     fn tls_settings_lifecycle_and_env_overrides() {
+        let _env_guard = ENV_LOCK.lock().unwrap();
         use super::TlsSettings;
 
         let tls = TlsSettings::default();
@@ -1662,5 +1713,114 @@ mod tests {
 
         handle.abort();
         let _ = std::fs::remove_file(&file_path);
+    }
+
+    #[test]
+    fn settings_new_missing_file_and_env_returns_descriptive_error() {
+        let _env_guard = ENV_LOCK.lock().unwrap();
+        use super::Settings;
+        // Ensure STEWARD_CONFIG_PATH is not set for this test
+        let prev_config_path = std::env::var("STEWARD_CONFIG_PATH").ok();
+        // Clear any STEWARD__* variables that might satisfy configuration
+        unsafe {
+            std::env::remove_var("STEWARD_CONFIG_PATH");
+            std::env::remove_var("STEWARD__LISTEN__ADDR");
+            std::env::remove_var("STEWARD__LISTEN__PORT");
+            std::env::remove_var("STEWARD__RATE_LIMIT_CONFIGS__FILE");
+            std::env::remove_var("STEWARD__RATE_LIMIT_CONFIGS__HTTP");
+        }
+
+        let result = Settings::new();
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("No configuration file found at STEWARD_CONFIG_PATH"),
+            "unexpected error message: {err_msg}"
+        );
+
+        if let Some(val) = prev_config_path {
+            unsafe {
+                std::env::set_var("STEWARD_CONFIG_PATH", val);
+            }
+        }
+    }
+
+    #[test]
+    fn settings_new_pure_environment_variable_configuration() {
+        let _env_guard = ENV_LOCK.lock().unwrap();
+        use super::Settings;
+        let prev_config_path = std::env::var("STEWARD_CONFIG_PATH").ok();
+        unsafe {
+            std::env::remove_var("STEWARD_CONFIG_PATH");
+
+            std::env::set_var("STEWARD__LISTEN__ADDR", "127.0.0.1");
+            std::env::set_var("STEWARD__LISTEN__PORT", "5099");
+            std::env::set_var(
+                "STEWARD__RATE_LIMIT_CONFIGS__FILE",
+                "/etc/steward/test-limits.json",
+            );
+            std::env::set_var("STEWARD__REDIS_HOST", "127.0.0.1:6379");
+        }
+
+        let settings = Settings::new().expect("should parse pure env config");
+        assert_eq!(settings.listen.port, 5099);
+        assert_eq!(
+            settings.listen.addr,
+            "127.0.0.1".parse::<std::net::Ipv4Addr>().unwrap()
+        );
+        match settings.rate_limit_configs {
+            super::ConfigSource::File(path) => {
+                assert_eq!(path, "/etc/steward/test-limits.json");
+            }
+            _ => panic!("expected File config source"),
+        }
+
+        unsafe {
+            std::env::remove_var("STEWARD__LISTEN__ADDR");
+            std::env::remove_var("STEWARD__LISTEN__PORT");
+            std::env::remove_var("STEWARD__RATE_LIMIT_CONFIGS__FILE");
+            std::env::remove_var("STEWARD__REDIS_HOST");
+
+            if let Some(val) = prev_config_path {
+                std::env::set_var("STEWARD_CONFIG_PATH", val);
+            }
+        }
+    }
+
+    #[test]
+    fn settings_new_steward_config_path_explicit_override() {
+        let _env_guard = ENV_LOCK.lock().unwrap();
+        use super::Settings;
+        let temp_dir = std::env::temp_dir();
+        let file_path = temp_dir.join(format!(
+            "steward_custom_settings_{}.yaml",
+            std::process::id()
+        ));
+        let content = r#"
+listen:
+  addr: 127.0.0.1
+  port: 5088
+rate_limit_configs:
+  file: /tmp/limits.json
+redis_host: 127.0.0.1:6379
+"#;
+        std::fs::write(&file_path, content).unwrap();
+
+        let prev_config_path = std::env::var("STEWARD_CONFIG_PATH").ok();
+        unsafe {
+            std::env::set_var("STEWARD_CONFIG_PATH", file_path.to_str().unwrap());
+        }
+
+        let settings = Settings::new().expect("should parse explicit config file");
+        assert_eq!(settings.listen.port, 5088);
+
+        let _ = std::fs::remove_file(&file_path);
+        unsafe {
+            if let Some(val) = prev_config_path {
+                std::env::set_var("STEWARD_CONFIG_PATH", val);
+            } else {
+                std::env::remove_var("STEWARD_CONFIG_PATH");
+            }
+        }
     }
 }

@@ -30,8 +30,12 @@ When Steward or its storage backend suffers catastrophic failure, operators have
 
 1. Update the active rate-limit configuration at its source:
    - **For File Source (`ConfigSource::File`):**
-     Edit the rate-limit configuration file directly or update the mounted Kubernetes ConfigMap:
+     Edit the rate-limit configuration file directly on the host or update the orchestration ConfigMap:
      ```bash
+     # Direct file edit:
+     nano /etc/steward/rate-limits.json
+
+     # Or Kubernetes ConfigMap:
      kubectl edit configmap steward-rate-limits -n steward-system
      ```
    - **For HTTP Source (`ConfigSource::Http`):**

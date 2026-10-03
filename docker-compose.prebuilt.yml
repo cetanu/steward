@@ -3,3 +3,8 @@ services:
     build:
       context: .
       dockerfile: containers/Dockerfile.prebuilt
+
+  server-replica-2:
+    build:
+      context: .
+      dockerfile: containers/Dockerfile.prebuilt
