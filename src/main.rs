@@ -40,6 +40,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "initial rate-limit configuration loaded and validated successfully"
     );
 
+    let initial_version_num = {
+        let prefix = &initial_config.version_hash[..16.min(initial_config.version_hash.len())];
+        u64::from_str_radix(prefix, 16).unwrap_or(0)
+    };
+    steward::metrics::gauge(&metrics, "config.version", initial_version_num);
+    steward::metrics::gauge(&metrics, "config.age_seconds", 0);
+
     let (config_tx, config_rx) = watch::channel(initial_config);
 
     spawn_config_loader(

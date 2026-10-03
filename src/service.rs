@@ -1,5 +1,8 @@
 use std::{
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -8,9 +11,9 @@ use redis::Script;
 use redis::aio::ConnectionManager;
 use tokio::sync::watch::Receiver;
 use tonic::Response;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error};
 
-use crate::metrics::{SharedMetrics, count, gauge, time};
+use crate::metrics::{ErrorRateLimiter, SharedMetrics, count, gauge, time};
 use crate::proto::envoy::service::ratelimit::v3::rate_limit_response::{Code, DescriptorStatus};
 use crate::proto::envoy::service::ratelimit::v3::rate_limit_service_server::RateLimitService;
 use crate::proto::envoy::service::ratelimit::v3::{RateLimitRequest, RateLimitResponse};
@@ -280,6 +283,21 @@ pub struct Steward {
     scripts: StewardScripts,
     pub execution_timeout: Duration,
     pub admission_semaphore: Arc<tokio::sync::Semaphore>,
+    pub in_flight: Arc<AtomicU64>,
+}
+
+/// RAII guard to track and automatically decrement in-flight requests on drop.
+pub struct InFlightGuard {
+    metrics: SharedMetrics,
+    counter: Arc<AtomicU64>,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        let prev = self.counter.fetch_sub(1, Ordering::SeqCst);
+        let in_flight = prev.saturating_sub(1);
+        gauge(&self.metrics, "in_flight_requests", in_flight);
+    }
 }
 
 impl Steward {
@@ -322,6 +340,7 @@ impl Steward {
             admission_semaphore: Arc::new(tokio::sync::Semaphore::new(
                 DEFAULT_MAX_CONCURRENT_REQUESTS,
             )),
+            in_flight: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -338,6 +357,21 @@ impl Steward {
     pub fn with_admission_semaphore(mut self, semaphore: Arc<tokio::sync::Semaphore>) -> Self {
         self.admission_semaphore = semaphore;
         self
+    }
+
+    pub fn with_metrics(mut self, metrics: SharedMetrics) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    pub fn in_flight_requests(&self) -> u64 {
+        self.in_flight.load(Ordering::Relaxed)
+    }
+
+    pub fn active_version_num(&self) -> u64 {
+        let hash = self.config_rx.borrow().version_hash.clone();
+        let prefix = &hash[..16.min(hash.len())];
+        u64::from_str_radix(prefix, 16).unwrap_or(0)
     }
 
     /// Calculate the effective execution timeout given an optional client timeout.
@@ -388,6 +422,7 @@ impl Steward {
             admission_semaphore: Arc::new(tokio::sync::Semaphore::new(
                 DEFAULT_MAX_CONCURRENT_REQUESTS,
             )),
+            in_flight: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -604,15 +639,29 @@ impl Steward {
         let res = self.check_limit(key, limit, op).await;
         time(&self.metrics, "redis.operation_time", started.elapsed());
         match &res {
-            Ok(decision) => {
-                gauge(
-                    &self.metrics,
-                    "rate_limit.observed",
-                    decision.observed.max(0) as u64,
-                );
+            Ok(_decision) => {
+                // Ambiguous fleet gauge `rate_limit.observed` eliminated per F13
             }
             Err(error) => {
-                error!(rate_limit_key = key, %error, "failed to update rate limit in Redis");
+                static REDIS_ERROR_LIMITER: ErrorRateLimiter = ErrorRateLimiter::new(1000);
+                if let Some(suppressed) = REDIS_ERROR_LIMITER.check() {
+                    if suppressed > 0 {
+                        error!(
+                            algorithm = ?limit.algorithm,
+                            unit = ?limit.unit,
+                            %error,
+                            suppressed_errors = suppressed,
+                            "failed to update rate limit in Redis (some errors suppressed)"
+                        );
+                    } else {
+                        error!(
+                            algorithm = ?limit.algorithm,
+                            unit = ?limit.unit,
+                            %error,
+                            "failed to update rate limit in Redis"
+                        );
+                    }
+                }
                 if is_redis_timeout(error) {
                     count(&self.metrics, "redis.timeouts", 1);
                 } else {
@@ -858,27 +907,65 @@ impl RateLimitService for Steward {
         &self,
         request: tonic::Request<RateLimitRequest>,
     ) -> Result<Response<RateLimitResponse>, tonic::Status> {
+        let rpc_start = std::time::Instant::now();
         count(&self.metrics, "requests.total", 1);
 
         // Global Admission Control (Load Shedding): Immediate non-blocking permit acquisition
+        let admission_start = std::time::Instant::now();
         let _permit = match self.admission_semaphore.clone().try_acquire_owned() {
-            Ok(permit) => permit,
+            Ok(permit) => {
+                time(
+                    &self.metrics,
+                    "admission.wait_time",
+                    admission_start.elapsed(),
+                );
+                permit
+            }
             Err(tokio::sync::TryAcquireError::NoPermits) => {
+                time(
+                    &self.metrics,
+                    "admission.wait_time",
+                    admission_start.elapsed(),
+                );
+                time(&self.metrics, "rpc.duration", rpc_start.elapsed());
                 count(&self.metrics, "requests.rejected_admission", 1);
                 return Err(tonic::Status::resource_exhausted(
                     "admission limit reached; request rejected due to load shedding",
                 ));
             }
             Err(tokio::sync::TryAcquireError::Closed) => {
+                time(
+                    &self.metrics,
+                    "admission.wait_time",
+                    admission_start.elapsed(),
+                );
+                time(&self.metrics, "rpc.duration", rpc_start.elapsed());
                 return Err(tonic::Status::unavailable("service is shutting down"));
             }
         };
+
+        // Track in-flight requests with RAII guard
+        let in_flight = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        gauge(&self.metrics, "in_flight_requests", in_flight);
+        let _in_flight_guard = InFlightGuard {
+            metrics: self.metrics.clone(),
+            counter: self.in_flight.clone(),
+        };
+
+        // Record active config age and version
+        gauge(
+            &self.metrics,
+            "config.age_seconds",
+            self.config_age_seconds(),
+        );
+        gauge(&self.metrics, "config.version", self.active_version_num());
 
         let (metadata, _, request) = request.into_parts();
 
         // 1. Request Dimension & Override Validation
         if let Err(status) = validate_request(&request) {
             count(&self.metrics, "requests.invalid", 1);
+            time(&self.metrics, "rpc.duration", rpc_start.elapsed());
             return Err(status);
         }
 
@@ -886,6 +973,7 @@ impl RateLimitService for Steward {
         let has_negative_hits = request.descriptors.iter().any(|d| d.is_negative_hits);
         if has_negative_hits && !is_trusted_caller(&metadata) {
             count(&self.metrics, "requests.unauthorized_refund", 1);
+            time(&self.metrics, "rpc.duration", rpc_start.elapsed());
             return Err(tonic::Status::permission_denied(
                 "untrusted caller cannot perform negative hits (refund)",
             ));
@@ -896,6 +984,10 @@ impl RateLimitService for Steward {
             let configs = self.config_rx.borrow();
             let Some(domain_policy) = configs.get(&request.domain) else {
                 count(&self.metrics, "requests.unconfigured", 1);
+                count(&self.metrics, "requests.allowed", 1);
+                time(&self.metrics, "rpc.duration.allowed", rpc_start.elapsed());
+                time(&self.metrics, "rpc.duration", rpc_start.elapsed());
+                debug!(domain = %request.domain, "unconfigured domain allowed");
                 let statuses = request
                     .descriptors
                     .iter()
@@ -939,6 +1031,7 @@ impl RateLimitService for Steward {
                                 .iter()
                                 .any(|l| l.algorithm == Algorithm::SlidingWindow)
                         {
+                            time(&self.metrics, "rpc.duration", rpc_start.elapsed());
                             return Err(tonic::Status::failed_precondition(
                                 "refunds are unsupported for sliding-window rate limits",
                             ));
@@ -996,6 +1089,7 @@ impl RateLimitService for Steward {
         let effective_timeout = self.effective_timeout(client_timeout);
 
         // 4. Redis Evaluation Phase (wrapped in bounded timeout, preserving 1:1 input descriptor order)
+        let redis_start = std::time::Instant::now();
         let default_ttl = self.default_ttl;
         let eval_result = tokio::time::timeout(effective_timeout, async {
             let eval_futures = evaluations.into_iter().map(|eval| async move {
@@ -1099,12 +1193,14 @@ impl RateLimitService for Steward {
             (statuses, any_rule_over_limit, first_redis_error)
         })
         .await;
+        time(&self.metrics, "redis.duration", redis_start.elapsed());
 
         let (statuses, any_rule_over_limit, first_redis_error) = match eval_result {
             Ok(result) => result,
             Err(_elapsed) => {
                 count(&self.metrics, "redis.timeouts", 1);
                 count(&self.metrics, "requests.deadline_exceeded", 1);
+                time(&self.metrics, "rpc.duration", rpc_start.elapsed());
                 return Err(tonic::Status::deadline_exceeded(
                     "request execution deadline exceeded",
                 ));
@@ -1115,8 +1211,10 @@ impl RateLimitService for Steward {
         if any_rule_over_limit {
             // Rule 1: Definitive quota rejection WINS!
             count(&self.metrics, "requests.over_limit", 1);
-            warn!(domain = %request.domain, "request is over the rate limit");
-            info!(
+            time(&self.metrics, "rpc.duration.denied", rpc_start.elapsed());
+            time(&self.metrics, "rpc.duration", rpc_start.elapsed());
+            debug!(domain = %request.domain, "request is over the rate limit");
+            debug!(
                 domain = %request.domain,
                 over_limit = true,
                 "rate limit decision complete"
@@ -1124,6 +1222,7 @@ impl RateLimitService for Steward {
             Ok(Response::new(build_response(true, statuses)))
         } else if let Some(err) = first_redis_error {
             // Rule 2: If NO rule was over limit, but one or more backend operations failed with a Redis error
+            time(&self.metrics, "rpc.duration", rpc_start.elapsed());
             if is_redis_timeout(&err) {
                 count(&self.metrics, "requests.deadline_exceeded", 1);
                 Err(tonic::Status::deadline_exceeded(
@@ -1136,7 +1235,9 @@ impl RateLimitService for Steward {
             }
         } else {
             count(&self.metrics, "requests.allowed", 1);
-            info!(
+            time(&self.metrics, "rpc.duration.allowed", rpc_start.elapsed());
+            time(&self.metrics, "rpc.duration", rpc_start.elapsed());
+            debug!(
                 domain = %request.domain,
                 over_limit = false,
                 "rate limit decision complete"
@@ -1773,6 +1874,7 @@ mod tests {
             admission_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 super::DEFAULT_MAX_CONCURRENT_REQUESTS,
             )),
+            in_flight: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         Some((server, steward, client))
     }
@@ -1815,6 +1917,7 @@ mod tests {
             admission_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 super::DEFAULT_MAX_CONCURRENT_REQUESTS,
             )),
+            in_flight: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
 
         let mut conn = client.get_connection().unwrap();
@@ -1900,6 +2003,7 @@ mod tests {
             admission_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 super::DEFAULT_MAX_CONCURRENT_REQUESTS,
             )),
+            in_flight: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
 
         let mut conn = client.get_connection().unwrap();
@@ -1982,6 +2086,7 @@ mod tests {
             admission_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 super::DEFAULT_MAX_CONCURRENT_REQUESTS,
             )),
+            in_flight: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
 
         use crate::proto::envoy::extensions::common::ratelimit::v3::{
@@ -2141,6 +2246,7 @@ mod tests {
             admission_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 super::DEFAULT_MAX_CONCURRENT_REQUESTS,
             )),
+            in_flight: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
 
         use crate::proto::envoy::extensions::common::ratelimit::v3::{
@@ -2215,6 +2321,7 @@ mod tests {
             admission_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 super::DEFAULT_MAX_CONCURRENT_REQUESTS,
             )),
+            in_flight: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
 
         let mut conn = client.get_connection().unwrap();
@@ -2345,6 +2452,7 @@ mod tests {
             admission_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 super::DEFAULT_MAX_CONCURRENT_REQUESTS,
             )),
+            in_flight: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
 
         use crate::proto::envoy::extensions::common::ratelimit::v3::{
@@ -3436,6 +3544,7 @@ mod tests {
             admission_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 super::DEFAULT_MAX_CONCURRENT_REQUESTS,
             )),
+            in_flight: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
 
         let make_req = || RateLimitRequest {
@@ -3550,6 +3659,7 @@ mod tests {
             scripts: super::StewardScripts::default(),
             execution_timeout: std::time::Duration::from_millis(10),
             admission_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(1024)),
+            in_flight: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
 
         // No client header -> defaults to execution_timeout (10ms)
@@ -3738,6 +3848,7 @@ mod tests {
             scripts: super::StewardScripts::default(),
             execution_timeout: std::time::Duration::from_millis(10),
             admission_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(1024)),
+            in_flight: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
 
         let make_req = || RateLimitRequest {
@@ -5651,5 +5762,231 @@ mod tests {
         assert_eq!(res2.statuses[0].code, Code::Ok as i32);
         assert_eq!(res2.statuses[1].code, Code::Ok as i32);
         assert_eq!(res2.statuses[2].code, Code::Ok as i32);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_telemetry_metrics_allowed_and_denied_flow() {
+        let Some((_server, steward, _client)) = setup_test_steward(r#"{
+            "domain": "telemetry_test",
+            "descriptors": [
+                {
+                    "key": "action",
+                    "value": "login",
+                    "rate_limit": { "algorithm": "fixed_window", "unit": "seconds", "requests_per_unit": 1 }
+                }
+            ]
+        }"#).await else {
+            eprintln!("Skipping test: redis-server not available");
+            return;
+        };
+
+        let (rx, sink) = cadence::SpyMetricSink::new();
+        let statsd_client = std::sync::Arc::new(cadence::StatsdClient::from_sink("steward", sink));
+        let steward = steward.with_metrics(statsd_client);
+
+        use crate::proto::envoy::extensions::common::ratelimit::v3::{
+            RateLimitDescriptor, rate_limit_descriptor::Entry,
+        };
+        use crate::proto::envoy::service::ratelimit::v3::RateLimitRequest;
+        use crate::proto::envoy::service::ratelimit::v3::rate_limit_service_server::RateLimitService;
+
+        let req = RateLimitRequest {
+            domain: "telemetry_test".to_string(),
+            descriptors: vec![RateLimitDescriptor {
+                entries: vec![Entry {
+                    key: "action".to_string(),
+                    value: "login".to_string(),
+                }],
+                limit: None,
+                hits_addend: Some(1),
+                is_negative_hits: false,
+            }],
+            hits_addend: 0,
+        };
+
+        // First request is allowed
+        let res1 = steward
+            .should_rate_limit(tonic::Request::new(req.clone()))
+            .await
+            .unwrap();
+        assert_eq!(res1.into_inner().overall_code, Code::Ok as i32);
+
+        // Collect emitted metrics
+        let mut metrics_received = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            metrics_received.push(String::from_utf8_lossy(&msg).to_string());
+        }
+
+        let combined = metrics_received.join("\n");
+        assert!(
+            combined.contains("steward.requests.total:1|c"),
+            "must emit requests.total"
+        );
+        assert!(
+            combined.contains("steward.requests.allowed:1|c"),
+            "must emit requests.allowed"
+        );
+        assert!(
+            combined.contains("steward.rpc.duration.allowed:"),
+            "must emit rpc.duration.allowed timer"
+        );
+        assert!(
+            combined.contains("steward.rpc.duration:"),
+            "must emit rpc.duration timer"
+        );
+        assert!(
+            combined.contains("steward.admission.wait_time:"),
+            "must emit admission.wait_time timer"
+        );
+        assert!(
+            combined.contains("steward.redis.duration:"),
+            "must emit redis.duration timer"
+        );
+        assert!(
+            combined.contains("steward.in_flight_requests:"),
+            "must emit in_flight_requests gauge"
+        );
+        assert!(
+            combined.contains("steward.config.age_seconds:"),
+            "must emit config.age_seconds gauge"
+        );
+        assert!(
+            combined.contains("steward.config.version:"),
+            "must emit config.version gauge"
+        );
+
+        // Second request is over limit
+        let res2 = steward
+            .should_rate_limit(tonic::Request::new(req))
+            .await
+            .unwrap();
+        assert_eq!(res2.into_inner().overall_code, Code::OverLimit as i32);
+
+        let mut metrics_received2 = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            metrics_received2.push(String::from_utf8_lossy(&msg).to_string());
+        }
+
+        let combined2 = metrics_received2.join("\n");
+        assert!(
+            combined2.contains("steward.requests.over_limit:1|c"),
+            "must emit requests.over_limit"
+        );
+        assert!(
+            combined2.contains("steward.rpc.duration.denied:"),
+            "must emit rpc.duration.denied timer"
+        );
+        assert!(
+            combined2.contains("steward.rpc.duration:"),
+            "must emit rpc.duration timer"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_metrics_on_admission_load_shedding() {
+        let raw: crate::config_source::RawRateLimitsConfig = serde_json::from_str(
+            r#"{
+            "domain": "test",
+            "descriptors": [
+                {
+                    "key": "a",
+                    "value": "b",
+                    "rate_limit": { "unit": "seconds", "requests_per_unit": 10 }
+                }
+            ]
+        }"#,
+        )
+        .unwrap();
+        let compiled = crate::config_source::compile_rate_limits(raw).unwrap();
+        let (_tx, rx_conf) = tokio::sync::watch::channel(compiled);
+
+        let (rx, sink) = cadence::SpyMetricSink::new();
+        let statsd_client = std::sync::Arc::new(cadence::StatsdClient::from_sink("steward", sink));
+
+        let steward = super::Steward::for_test(rx_conf)
+            .await
+            .with_metrics(statsd_client)
+            .with_max_concurrent_requests(0); // 0 permits -> load shedding
+
+        use crate::proto::envoy::service::ratelimit::v3::RateLimitRequest;
+        use crate::proto::envoy::service::ratelimit::v3::rate_limit_service_server::RateLimitService;
+
+        let req = RateLimitRequest {
+            domain: "test".to_string(),
+            descriptors: vec![],
+            hits_addend: 0,
+        };
+
+        let err = steward
+            .should_rate_limit(tonic::Request::new(req))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+
+        let mut metrics_received = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            metrics_received.push(String::from_utf8_lossy(&msg).to_string());
+        }
+        let combined = metrics_received.join("\n");
+        assert!(combined.contains("steward.requests.total:1|c"));
+        assert!(combined.contains("steward.requests.rejected_admission:1|c"));
+        assert!(combined.contains("steward.admission.wait_time:"));
+        assert!(combined.contains("steward.rpc.duration:"));
+    }
+
+    #[tokio::test]
+    async fn test_in_flight_gauge_lifecycle() {
+        let raw: crate::config_source::RawRateLimitsConfig = serde_json::from_str(
+            r#"{
+            "domain": "configured_domain",
+            "descriptors": [
+                {
+                    "key": "a",
+                    "value": "b",
+                    "rate_limit": { "unit": "seconds", "requests_per_unit": 10 }
+                }
+            ]
+        }"#,
+        )
+        .unwrap();
+        let compiled = crate::config_source::compile_rate_limits(raw).unwrap();
+        let (_tx, rx_conf) = tokio::sync::watch::channel(compiled);
+
+        let (rx, sink) = cadence::SpyMetricSink::new();
+        let statsd_client = std::sync::Arc::new(cadence::StatsdClient::from_sink("steward", sink));
+
+        let steward = super::Steward::for_test(rx_conf)
+            .await
+            .with_metrics(statsd_client);
+
+        use crate::proto::envoy::service::ratelimit::v3::RateLimitRequest;
+        use crate::proto::envoy::service::ratelimit::v3::rate_limit_service_server::RateLimitService;
+
+        assert_eq!(steward.in_flight_requests(), 0);
+
+        let req = RateLimitRequest {
+            domain: "unconfigured_domain".to_string(),
+            descriptors: vec![],
+            hits_addend: 0,
+        };
+
+        let _ = steward.should_rate_limit(tonic::Request::new(req)).await;
+
+        // In-flight should return to 0
+        assert_eq!(steward.in_flight_requests(), 0);
+
+        let mut metrics_received = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            metrics_received.push(String::from_utf8_lossy(&msg).to_string());
+        }
+        let combined = metrics_received.join("\n");
+        assert!(
+            combined.contains("steward.in_flight_requests:1|g"),
+            "must track 1 in-flight during request"
+        );
+        assert!(
+            combined.contains("steward.in_flight_requests:0|g"),
+            "must restore 0 in-flight after request completion"
+        );
     }
 }

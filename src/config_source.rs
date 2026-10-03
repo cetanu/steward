@@ -323,7 +323,12 @@ pub fn spawn_config_loader(
                     if config_tx.send(new_config).is_err() {
                         break;
                     }
+                    let version_num = {
+                        let prefix = &version_hash[..16.min(version_hash.len())];
+                        u64::from_str_radix(prefix, 16).unwrap_or(0)
+                    };
                     count(&metrics, "config.reloads", 1);
+                    gauge(&metrics, "config.version", version_num);
                     gauge(&metrics, "config.age_seconds", 0);
                     tracing::info!(domains, %version_hash, "reloaded rate-limit configuration");
                 }
