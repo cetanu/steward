@@ -469,7 +469,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("3. Initializing Steward service on 127.0.0.1:50051...");
     let steward = Steward::try_new(
         &format!("127.0.0.1:{redis_port}"),
-        10,
         rx,
         Arc::new(cadence::StatsdClient::from_sink("", cadence::NopMetricSink)),
     )

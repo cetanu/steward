@@ -141,7 +141,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let baseline_steward = Steward::try_new(
         &format!("127.0.0.1:{redis_port}"),
-        10,
         b_rx,
         Arc::new(cadence::StatsdClient::from_sink("", cadence::NopMetricSink)),
     )
@@ -164,7 +163,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let canary_steward = Steward::try_new(
         &format!("127.0.0.1:{redis_port}"),
-        10,
         c_rx,
         Arc::new(cadence::StatsdClient::from_sink("", cadence::NopMetricSink)),
     )
