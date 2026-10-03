@@ -93,6 +93,7 @@ static_resources:
                     grpc_service:
                       envoy_grpc:
                         cluster_name: rls
+                      timeout: 0.020s
                     transport_api_version: V3
                   enable_x_ratelimit_headers: DRAFT_VERSION_03
               - name: envoy.filters.http.router

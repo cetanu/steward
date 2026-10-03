@@ -370,6 +370,10 @@ pub struct Settings {
     pub config_refresh_interval_secs: u64,
     #[serde(default)]
     pub metrics: Option<MetricsConfig>,
+    #[serde(default = "default_execution_timeout_ms")]
+    pub execution_timeout_ms: u64,
+    #[serde(default = "default_max_concurrent_requests")]
+    pub max_concurrent_requests: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -384,6 +388,14 @@ pub struct StatsdConfig {
     pub prefix: String,
     #[serde(default = "default_statsd_queue_capacity")]
     pub queue_capacity: usize,
+}
+
+fn default_execution_timeout_ms() -> u64 {
+    10
+}
+
+fn default_max_concurrent_requests() -> usize {
+    1_024
 }
 
 fn default_redis_connections() -> Option<usize> {

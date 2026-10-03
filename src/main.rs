@@ -55,7 +55,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config_rx,
         metrics,
     )
-    .await?;
+    .await?
+    .with_execution_timeout(std::time::Duration::from_millis(
+        settings.execution_timeout_ms,
+    ))
+    .with_max_concurrent_requests(settings.max_concurrent_requests);
 
     let addr = SocketAddr::new(settings.listen.addr.into(), settings.listen.port);
     let socket = Socket::new(Domain::for_address(addr), Type::STREAM, None)?;
@@ -69,7 +73,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!(%addr, "starting Steward rate-limit service");
     Server::builder()
-        .tcp_keepalive(Some(std::time::Duration::from_secs(60)))
+        .concurrency_limit_per_connection(1024)
+        .tcp_keepalive(Some(std::time::Duration::from_secs(30)))
+        .tcp_nodelay(true)
         .http2_keepalive_interval(Some(std::time::Duration::from_secs(60)))
         .http2_keepalive_timeout(Some(std::time::Duration::from_secs(60)))
         .add_service(RateLimitServiceServer::new(steward))
