@@ -8,6 +8,7 @@ use std::{
 
 use cadence::{NopMetricSink, StatsdClient};
 use redis::Script;
+use redis::aio::ConnectionManager;
 use tokio::sync::watch::Receiver;
 use tonic::Response;
 use tracing::{debug, error, info, warn};
@@ -30,6 +31,27 @@ const TOKEN_BUCKET_REFUND_SCRIPT: &str = include_str!("scripts/token_bucket_refu
 const SLIDING_WINDOW_SCRIPT: &str = include_str!("scripts/sliding_window.lua");
 
 static REQUEST_NONCE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone)]
+pub struct StewardScripts {
+    pub fixed_window: Script,
+    pub fixed_window_refund: Script,
+    pub token_bucket: Script,
+    pub token_bucket_refund: Script,
+    pub sliding_window: Script,
+}
+
+impl Default for StewardScripts {
+    fn default() -> Self {
+        Self {
+            fixed_window: Script::new(FIXED_WINDOW_SCRIPT),
+            fixed_window_refund: Script::new(FIXED_WINDOW_REFUND_SCRIPT),
+            token_bucket: Script::new(TOKEN_BUCKET_SCRIPT),
+            token_bucket_refund: Script::new(TOKEN_BUCKET_REFUND_SCRIPT),
+            sliding_window: Script::new(SLIDING_WINDOW_SCRIPT),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HitOperation {
@@ -54,51 +76,51 @@ enum DescriptorEvaluation {
     Matched(DescriptorMatch),
 }
 
+#[derive(Clone)]
 pub struct Steward {
     config_rx: Receiver<RateLimitConfigs>,
-    redis_pool: r2d2::Pool<redis::Client>,
+    redis: ConnectionManager,
     default_ttl: usize,
     metrics: SharedMetrics,
+    scripts: StewardScripts,
 }
 
 impl Steward {
     /// Construct a service with metrics disabled.
-    pub fn new(
+    pub async fn new(
         redis_host: &str,
         default_ttl: usize,
         config_rx: Receiver<RateLimitConfigs>,
-        pool_size: usize,
     ) -> Self {
         Self::try_new(
             redis_host,
             default_ttl,
             config_rx,
-            pool_size,
             std::sync::Arc::new(StatsdClient::from_sink("", NopMetricSink)),
         )
+        .await
         .expect("failed to create Steward service")
     }
 
-    /// Construct a service and return configuration or pool initialization errors.
-    pub fn try_new(
+    /// Construct a service and return configuration or connection manager initialization errors.
+    pub async fn try_new(
         redis_host: &str,
         default_ttl: usize,
         config_rx: Receiver<RateLimitConfigs>,
-        pool_size: usize,
         metrics: SharedMetrics,
     ) -> Result<Self, String> {
-        let manager = redis::Client::open(format!("redis://{redis_host}"))
+        let client = redis::Client::open(format!("redis://{redis_host}"))
             .map_err(|error| format!("invalid Redis configuration: {error}"))?;
-        let redis_pool = r2d2::Pool::builder()
-            .max_size(pool_size.max(1) as u32)
-            .build(manager)
-            .map_err(|error| format!("failed to create Redis connection pool: {error}"))?;
+        let redis = ConnectionManager::new(client)
+            .await
+            .map_err(|error| format!("failed to create Redis connection manager: {error}"))?;
 
         Ok(Self {
             config_rx,
-            redis_pool,
+            redis,
             default_ttl,
             metrics,
+            scripts: StewardScripts::default(),
         })
     }
 
@@ -115,32 +137,32 @@ impl Steward {
     }
 
     #[cfg(test)]
-    pub fn for_test(config_rx: Receiver<RateLimitConfigs>) -> Self {
-        let manager = redis::Client::open("redis://127.0.0.1:6379").unwrap();
-        let redis_pool = r2d2::Pool::builder()
-            .min_idle(Some(0))
-            .build_unchecked(manager);
+    pub async fn for_test(config_rx: Receiver<RateLimitConfigs>) -> Self {
+        let client = redis::Client::open("redis://127.0.0.1:6379").unwrap();
+        let redis = match ConnectionManager::new(client.clone()).await {
+            Ok(mgr) => mgr,
+            Err(_) => ConnectionManager::new_lazy_with_config(
+                client,
+                redis::aio::ConnectionManagerConfig::default(),
+            )
+            .unwrap(),
+        };
         Self {
             config_rx,
-            redis_pool,
+            redis,
             default_ttl: 10,
             metrics: Arc::new(StatsdClient::from_sink("", NopMetricSink)),
+            scripts: StewardScripts::default(),
         }
     }
 
-    pub fn check_limit(
+    pub async fn check_limit(
         &self,
         key: &str,
         limit: &RateLimit,
         op: HitOperation,
     ) -> redis::RedisResult<Decision> {
-        let mut connection = self.redis_pool.get().map_err(|error| {
-            redis::RedisError::from((
-                redis::ErrorKind::Io,
-                "failed to acquire Redis connection",
-                error.to_string(),
-            ))
-        })?;
+        let mut connection = self.redis.clone();
         let window_seconds = limit
             .unit
             .seconds()
@@ -150,8 +172,10 @@ impl Steward {
         match op {
             HitOperation::Probe => match limit.algorithm {
                 Algorithm::FixedWindow => {
-                    let current: Option<i64> =
-                        redis::cmd("GET").arg(key).query(&mut *connection)?;
+                    let current: Option<i64> = redis::cmd("GET")
+                        .arg(key)
+                        .query_async(&mut connection)
+                        .await?;
                     let current = current.unwrap_or(0);
                     Ok(Decision {
                         allowed: current <= limit.requests_per_unit,
@@ -166,7 +190,8 @@ impl Steward {
                         .arg(key)
                         .arg("tokens")
                         .arg("timestamp_ms")
-                        .query(&mut *connection)?;
+                        .query_async(&mut connection)
+                        .await?;
                     let tokens = match state.0 {
                         None => capacity,
                         Some(t) => {
@@ -186,7 +211,8 @@ impl Steward {
                         .arg(key)
                         .arg(now_millis() - window_ms)
                         .arg("+inf")
-                        .query(&mut *connection)?;
+                        .query_async(&mut connection)
+                        .await?;
                     Ok(Decision {
                         allowed: count <= limit.requests_per_unit,
                         observed: count,
@@ -195,10 +221,13 @@ impl Steward {
             },
             HitOperation::Refund(hits) => match limit.algorithm {
                 Algorithm::FixedWindow => {
-                    let current: i64 = Script::new(FIXED_WINDOW_REFUND_SCRIPT)
+                    let current: i64 = self
+                        .scripts
+                        .fixed_window_refund
                         .key(key)
                         .arg(hits as i64)
-                        .invoke(&mut *connection)?;
+                        .invoke_async(&mut connection)
+                        .await?;
                     Ok(Decision {
                         allowed: true,
                         observed: current,
@@ -208,14 +237,17 @@ impl Steward {
                     let window_ms = window_seconds.saturating_mul(1_000).max(1);
                     let capacity = limit.requests_per_unit as f64;
                     let refill_per_ms = capacity / window_ms as f64;
-                    let result: Vec<i64> = Script::new(TOKEN_BUCKET_REFUND_SCRIPT)
+                    let result: Vec<i64> = self
+                        .scripts
+                        .token_bucket_refund
                         .key(key)
                         .arg(now_millis())
                         .arg(capacity)
                         .arg(refill_per_ms)
                         .arg(hits as i64)
                         .arg(window_ms)
-                        .invoke(&mut *connection)?;
+                        .invoke_async(&mut connection)
+                        .await?;
                     Ok(Decision {
                         allowed: result.first().copied().unwrap_or(1) == 1,
                         observed: result.get(1).copied().unwrap_or_default(),
@@ -230,11 +262,14 @@ impl Steward {
                 let hits = hits as i64;
                 match limit.algorithm {
                     Algorithm::FixedWindow => {
-                        let current: i64 = Script::new(FIXED_WINDOW_SCRIPT)
+                        let current: i64 = self
+                            .scripts
+                            .fixed_window
                             .key(key)
                             .arg(hits)
                             .arg(window_seconds)
-                            .invoke(&mut *connection)?;
+                            .invoke_async(&mut connection)
+                            .await?;
                         Ok(Decision {
                             allowed: current <= limit.requests_per_unit,
                             observed: current,
@@ -244,14 +279,17 @@ impl Steward {
                         let window_ms = window_seconds.saturating_mul(1_000).max(1);
                         let capacity = limit.requests_per_unit as f64;
                         let refill_per_ms = capacity / window_ms as f64;
-                        let result: Vec<i64> = Script::new(TOKEN_BUCKET_SCRIPT)
+                        let result: Vec<i64> = self
+                            .scripts
+                            .token_bucket
                             .key(key)
                             .arg(now_millis())
                             .arg(capacity)
                             .arg(refill_per_ms)
                             .arg(hits)
                             .arg(window_ms)
-                            .invoke(&mut *connection)?;
+                            .invoke_async(&mut connection)
+                            .await?;
                         Ok(Decision {
                             allowed: result.first().copied().unwrap_or_default() == 1,
                             observed: result.get(1).copied().unwrap_or_default(),
@@ -261,14 +299,17 @@ impl Steward {
                         let window_ms = window_seconds.saturating_mul(1_000).max(1);
                         let nonce = REQUEST_NONCE.fetch_add(1, Ordering::Relaxed);
                         let nonce = format!("{}-{nonce}", now_millis());
-                        let result: Vec<i64> = Script::new(SLIDING_WINDOW_SCRIPT)
+                        let result: Vec<i64> = self
+                            .scripts
+                            .sliding_window
                             .key(key)
                             .arg(now_millis())
                             .arg(window_ms)
                             .arg(limit.requests_per_unit)
                             .arg(hits)
                             .arg(nonce)
-                            .invoke(&mut *connection)?;
+                            .invoke_async(&mut connection)
+                            .await?;
                         Ok(Decision {
                             allowed: result.first().copied().unwrap_or_default() == 1,
                             observed: result.get(1).copied().unwrap_or_default(),
@@ -279,14 +320,14 @@ impl Steward {
         }
     }
 
-    pub fn execute_check_limit(
+    pub async fn execute_check_limit(
         &self,
         key: &str,
         limit: &RateLimit,
         op: HitOperation,
     ) -> Result<Decision, redis::RedisError> {
         let started = std::time::Instant::now();
-        let res = self.check_limit(key, limit, op);
+        let res = self.check_limit(key, limit, op).await;
         time(&self.metrics, "redis.operation_time", started.elapsed());
         match &res {
             Ok(decision) => {
@@ -667,86 +708,82 @@ impl RateLimitService for Steward {
 
         // 4. Redis Evaluation Phase (preserving 1:1 input descriptor order)
         let default_ttl = self.default_ttl;
-        let (statuses, any_rule_over_limit, first_redis_error) =
-            tokio::task::block_in_place(|| {
-                let mut statuses = Vec::with_capacity(evaluations.len());
-                let mut any_rule_over_limit = false;
-                let mut first_redis_error = None;
+        let mut statuses = Vec::with_capacity(evaluations.len());
+        let mut any_rule_over_limit = false;
+        let mut first_redis_error = None;
 
-                for eval in evaluations {
-                    match eval {
-                        DescriptorEvaluation::Unmatched => {
-                            count(&self.metrics, "descriptors.unmatched", 1);
-                            statuses.push(DescriptorStatus {
-                                code: Code::Ok as i32,
-                                current_limit: None,
-                                limit_remaining: 0,
-                                duration_until_reset: None,
-                                quota: None,
-                            });
-                        }
-                        DescriptorEvaluation::Matched(desc_match) => {
-                            let mut successful_decisions =
-                                Vec::with_capacity(desc_match.limits_to_check.len());
-                            let mut failed_rules = Vec::new();
+        for eval in evaluations {
+            match eval {
+                DescriptorEvaluation::Unmatched => {
+                    count(&self.metrics, "descriptors.unmatched", 1);
+                    statuses.push(DescriptorStatus {
+                        code: Code::Ok as i32,
+                        current_limit: None,
+                        limit_remaining: 0,
+                        duration_until_reset: None,
+                        quota: None,
+                    });
+                }
+                DescriptorEvaluation::Matched(desc_match) => {
+                    let mut successful_decisions =
+                        Vec::with_capacity(desc_match.limits_to_check.len());
+                    let mut failed_rules = Vec::new();
 
-                            for (key, limit) in &desc_match.limits_to_check {
-                                let result =
-                                    self.execute_check_limit(key, limit, desc_match.operation);
-                                match result {
-                                    Ok(decision) => {
-                                        if !decision.allowed {
-                                            any_rule_over_limit = true;
-                                        }
-                                        successful_decisions.push((limit, decision));
-                                    }
-                                    Err(error) => {
-                                        if first_redis_error.is_none() {
-                                            first_redis_error = Some(error.clone());
-                                        }
-                                        failed_rules.push((limit, error));
-                                    }
+                    for (key, limit) in &desc_match.limits_to_check {
+                        let result = self
+                            .execute_check_limit(key, limit, desc_match.operation)
+                            .await;
+                        match result {
+                            Ok(decision) => {
+                                if !decision.allowed {
+                                    any_rule_over_limit = true;
                                 }
+                                successful_decisions.push((limit, decision));
                             }
-
-                            let has_over_limit =
-                                successful_decisions.iter().any(|(_, dec)| !dec.allowed);
-
-                            if has_over_limit {
-                                let violated: Vec<(&RateLimit, &Decision)> = successful_decisions
-                                    .iter()
-                                    .filter(|(_, dec)| !dec.allowed)
-                                    .map(|(l, d)| (*l, d))
-                                    .collect();
-                                let status = aggregate_descriptor_status(&violated, default_ttl);
-                                statuses.push(status);
-                            } else if failed_rules.is_empty() {
-                                let pairs: Vec<(&RateLimit, &Decision)> =
-                                    successful_decisions.iter().map(|(l, d)| (*l, d)).collect();
-                                let status = aggregate_descriptor_status(&pairs, default_ttl);
-                                statuses.push(status);
-                            } else {
-                                let gov_limit = successful_decisions
-                                    .first()
-                                    .map(|(l, _)| **l)
-                                    .unwrap_or(desc_match.limits_to_check[0].1);
-                                let reset_secs = duration_until_reset_for(&gov_limit, default_ttl);
-                                statuses.push(DescriptorStatus {
-                                    code: Code::Unknown as i32,
-                                    current_limit: Some(gov_limit.to_proto()),
-                                    limit_remaining: 0,
-                                    duration_until_reset: Some(prost_types::Duration {
-                                        seconds: reset_secs as i64,
-                                        nanos: 0,
-                                    }),
-                                    quota: None,
-                                });
+                            Err(error) => {
+                                if first_redis_error.is_none() {
+                                    first_redis_error = Some(error.clone());
+                                }
+                                failed_rules.push((limit, error));
                             }
                         }
                     }
+
+                    let has_over_limit = successful_decisions.iter().any(|(_, dec)| !dec.allowed);
+
+                    if has_over_limit {
+                        let violated: Vec<(&RateLimit, &Decision)> = successful_decisions
+                            .iter()
+                            .filter(|(_, dec)| !dec.allowed)
+                            .map(|(l, d)| (*l, d))
+                            .collect();
+                        let status = aggregate_descriptor_status(&violated, default_ttl);
+                        statuses.push(status);
+                    } else if failed_rules.is_empty() {
+                        let pairs: Vec<(&RateLimit, &Decision)> =
+                            successful_decisions.iter().map(|(l, d)| (*l, d)).collect();
+                        let status = aggregate_descriptor_status(&pairs, default_ttl);
+                        statuses.push(status);
+                    } else {
+                        let gov_limit = successful_decisions
+                            .first()
+                            .map(|(l, _)| **l)
+                            .unwrap_or(desc_match.limits_to_check[0].1);
+                        let reset_secs = duration_until_reset_for(&gov_limit, default_ttl);
+                        statuses.push(DescriptorStatus {
+                            code: Code::Unknown as i32,
+                            current_limit: Some(gov_limit.to_proto()),
+                            limit_remaining: 0,
+                            duration_until_reset: Some(prost_types::Duration {
+                                seconds: reset_secs as i64,
+                                nanos: 0,
+                            }),
+                            quota: None,
+                        });
+                    }
                 }
-                (statuses, any_rule_over_limit, first_redis_error)
-            });
+            }
+        }
 
         // 5. Overall response code aggregation & F06 Error Precedence Rule
         if any_rule_over_limit {
@@ -952,8 +989,8 @@ mod tests {
         assert!(reset <= 60);
     }
 
-    #[test]
-    fn steward_exposes_active_version_hash_and_age() {
+    #[tokio::test]
+    async fn steward_exposes_active_version_hash_and_age() {
         let json_str = r#"{
             "domain": "default",
             "descriptors": [
@@ -970,7 +1007,7 @@ mod tests {
         let expected_hash = compiled.version_hash.clone();
         let (_tx, rx) = tokio::sync::watch::channel(compiled);
 
-        let steward = super::Steward::for_test(rx);
+        let steward = super::Steward::for_test(rx).await;
         assert_eq!(steward.active_version_hash(), expected_hash);
         assert_eq!(steward.active_config().version_hash, expected_hash);
         let _ = steward.config_age_seconds();
@@ -1267,7 +1304,7 @@ mod tests {
             serde_json::from_str(json_str).unwrap();
         let compiled = crate::config_source::compile_rate_limits(raw).unwrap();
         let (_tx, rx) = tokio::sync::watch::channel(compiled);
-        let steward = super::Steward::for_test(rx);
+        let steward = super::Steward::for_test(rx).await;
 
         // 1. Untrusted caller attempting negative hits -> PermissionDenied
         let req_untrusted = RateLimitRequest {
@@ -1385,36 +1422,41 @@ mod tests {
         Some((port, child))
     }
 
-    fn setup_test_steward(
+    async fn setup_test_steward(
         json_str: &str,
     ) -> Option<(TestRedisServer, super::Steward, redis::Client)> {
         let server = TestRedisServer::start()?;
         let client = redis::Client::open(format!("redis://127.0.0.1:{}", server.port)).ok()?;
-        let pool = r2d2::Pool::builder().build(client.clone()).ok()?;
+        let redis = redis::aio::ConnectionManager::new(client.clone())
+            .await
+            .ok()?;
         let raw: crate::config_source::RawRateLimitsConfig = serde_json::from_str(json_str).ok()?;
         let compiled = crate::config_source::compile_rate_limits(raw).ok()?;
         let (_tx, rx) = tokio::sync::watch::channel(compiled);
         let steward = super::Steward {
             config_rx: rx,
-            redis_pool: pool,
+            redis,
             default_ttl: 10,
             metrics: std::sync::Arc::new(cadence::StatsdClient::from_sink(
                 "",
                 cadence::NopMetricSink,
             )),
+            scripts: super::StewardScripts::default(),
         };
         Some((server, steward, client))
     }
 
-    #[test]
-    fn zero_cost_probe_returns_remaining_without_mutating_redis() {
+    #[tokio::test]
+    async fn zero_cost_probe_returns_remaining_without_mutating_redis() {
         let Some(_server) = TestRedisServer::start() else {
             eprintln!("Skipping zero-cost probe test: redis-server not available");
             return;
         };
 
         let client = redis::Client::open(format!("redis://127.0.0.1:{}", _server.port)).unwrap();
-        let pool = r2d2::Pool::builder().build(client.clone()).unwrap();
+        let redis = redis::aio::ConnectionManager::new(client.clone())
+            .await
+            .unwrap();
         let json_str = r#"{
             "domain": "default",
             "descriptors": [
@@ -1431,12 +1473,13 @@ mod tests {
         let (_tx, rx) = tokio::sync::watch::channel(compiled);
         let steward = super::Steward {
             config_rx: rx,
-            redis_pool: pool,
+            redis,
             default_ttl: 10,
             metrics: std::sync::Arc::new(cadence::StatsdClient::from_sink(
                 "",
                 cadence::NopMetricSink,
             )),
+            scripts: super::StewardScripts::default(),
         };
 
         let mut conn = client.get_connection().unwrap();
@@ -1452,6 +1495,7 @@ mod tests {
 
         let decision = steward
             .check_limit(test_key, &limit, super::HitOperation::Probe)
+            .await
             .unwrap();
         assert!(decision.allowed);
         assert_eq!(decision.observed, 0);
@@ -1469,6 +1513,7 @@ mod tests {
             .unwrap();
         let decision = steward
             .check_limit(test_key, &limit, super::HitOperation::Probe)
+            .await
             .unwrap();
         assert!(decision.allowed);
         assert_eq!(decision.observed, 4);
@@ -1482,15 +1527,17 @@ mod tests {
         let _: () = redis::cmd("DEL").arg(test_key).query(&mut conn).unwrap();
     }
 
-    #[test]
-    fn fixed_window_refund_decrements_and_clamps_at_zero() {
+    #[tokio::test]
+    async fn fixed_window_refund_decrements_and_clamps_at_zero() {
         let Some(_server) = TestRedisServer::start() else {
             eprintln!("Skipping fixed-window refund test: redis-server not available");
             return;
         };
 
         let client = redis::Client::open(format!("redis://127.0.0.1:{}", _server.port)).unwrap();
-        let pool = r2d2::Pool::builder().build(client.clone()).unwrap();
+        let redis = redis::aio::ConnectionManager::new(client.clone())
+            .await
+            .unwrap();
         let json_str = r#"{
             "domain": "default",
             "descriptors": [
@@ -1507,12 +1554,13 @@ mod tests {
         let (_tx, rx) = tokio::sync::watch::channel(compiled);
         let steward = super::Steward {
             config_rx: rx,
-            redis_pool: pool,
+            redis,
             default_ttl: 10,
             metrics: std::sync::Arc::new(cadence::StatsdClient::from_sink(
                 "",
                 cadence::NopMetricSink,
             )),
+            scripts: super::StewardScripts::default(),
         };
 
         let mut conn = client.get_connection().unwrap();
@@ -1533,6 +1581,7 @@ mod tests {
         // Refund 2 -> counter should become 3
         let decision = steward
             .check_limit(test_key, &limit, super::HitOperation::Refund(2))
+            .await
             .unwrap();
         assert!(decision.allowed);
         assert_eq!(decision.observed, 3);
@@ -1542,6 +1591,7 @@ mod tests {
         // Refund 5 from counter at 3 -> clamped at 0 (never negative)
         let decision = steward
             .check_limit(test_key, &limit, super::HitOperation::Refund(5))
+            .await
             .unwrap();
         assert!(decision.allowed);
         assert_eq!(decision.observed, 0);
@@ -1560,7 +1610,7 @@ mod tests {
         };
 
         let client = redis::Client::open(format!("redis://127.0.0.1:{}", server.port)).unwrap();
-        let pool = r2d2::Pool::builder().build(client).unwrap();
+        let redis = redis::aio::ConnectionManager::new(client).await.unwrap();
         let json_str = r#"{
             "domain": "default",
             "descriptors": [
@@ -1582,12 +1632,13 @@ mod tests {
         let (_tx, rx) = tokio::sync::watch::channel(compiled);
         let steward = super::Steward {
             config_rx: rx,
-            redis_pool: pool,
+            redis,
             default_ttl: 10,
             metrics: std::sync::Arc::new(cadence::StatsdClient::from_sink(
                 "",
                 cadence::NopMetricSink,
             )),
+            scripts: super::StewardScripts::default(),
         };
 
         use crate::proto::envoy::extensions::common::ratelimit::v3::{
@@ -1729,18 +1780,19 @@ mod tests {
 
         // Use a client pointing to an unreachable port to guarantee connection error
         let client = redis::Client::open("redis://127.0.0.1:1").unwrap();
-        let pool = r2d2::Pool::builder()
-            .connection_timeout(std::time::Duration::from_millis(50))
-            .build_unchecked(client);
+        let mut config = redis::aio::ConnectionManagerConfig::new();
+        config = config.set_connection_timeout(Some(std::time::Duration::from_millis(50)));
+        let redis = redis::aio::ConnectionManager::new_lazy_with_config(client, config).unwrap();
 
         let steward = super::Steward {
             config_rx: rx,
-            redis_pool: pool,
+            redis,
             default_ttl: 10,
             metrics: std::sync::Arc::new(cadence::StatsdClient::from_sink(
                 "",
                 cadence::NopMetricSink,
             )),
+            scripts: super::StewardScripts::default(),
         };
 
         use crate::proto::envoy::extensions::common::ratelimit::v3::{
@@ -1780,7 +1832,9 @@ mod tests {
         };
 
         let client = redis::Client::open(format!("redis://127.0.0.1:{}", server.port)).unwrap();
-        let pool = r2d2::Pool::builder().build(client.clone()).unwrap();
+        let redis = redis::aio::ConnectionManager::new(client.clone())
+            .await
+            .unwrap();
         let json_str = r#"{
             "domain": "default",
             "descriptors": [
@@ -1802,12 +1856,13 @@ mod tests {
         let (_tx, rx) = tokio::sync::watch::channel(compiled);
         let steward = super::Steward {
             config_rx: rx,
-            redis_pool: pool,
+            redis,
             default_ttl: 10,
             metrics: std::sync::Arc::new(cadence::StatsdClient::from_sink(
                 "",
                 cadence::NopMetricSink,
             )),
+            scripts: super::StewardScripts::default(),
         };
 
         let mut conn = client.get_connection().unwrap();
@@ -1910,7 +1965,7 @@ mod tests {
         };
 
         let client = redis::Client::open(format!("redis://127.0.0.1:{}", server.port)).unwrap();
-        let pool = r2d2::Pool::builder().build(client).unwrap();
+        let redis = redis::aio::ConnectionManager::new(client).await.unwrap();
         let json_str = r#"{
             "domain": "default",
             "descriptors": [
@@ -1927,12 +1982,13 @@ mod tests {
         let (_tx, rx) = tokio::sync::watch::channel(compiled);
         let steward = super::Steward {
             config_rx: rx,
-            redis_pool: pool,
+            redis,
             default_ttl: 10,
             metrics: std::sync::Arc::new(cadence::StatsdClient::from_sink(
                 "",
                 cadence::NopMetricSink,
             )),
+            scripts: super::StewardScripts::default(),
         };
 
         use crate::proto::envoy::extensions::common::ratelimit::v3::{
@@ -2002,7 +2058,7 @@ mod tests {
             serde_json::from_str(json_str).unwrap();
         let compiled = crate::config_source::compile_rate_limits(raw).unwrap();
         let (_tx, rx) = tokio::sync::watch::channel(compiled);
-        let steward = super::Steward::for_test(rx);
+        let steward = super::Steward::for_test(rx).await;
 
         use crate::proto::envoy::extensions::common::ratelimit::v3::{
             RateLimitDescriptor, rate_limit_descriptor::Entry,
@@ -2107,7 +2163,7 @@ mod tests {
         }}"#
         );
 
-        let Some((_server, steward, client)) = setup_test_steward(&config_json) else {
+        let Some((_server, steward, client)) = setup_test_steward(&config_json).await else {
             eprintln!("Skipping test: redis-server not available");
             return;
         };
@@ -2226,7 +2282,7 @@ mod tests {
         }}"#
         );
 
-        let Some((_server, steward, _client)) = setup_test_steward(&config_json) else {
+        let Some((_server, steward, _client)) = setup_test_steward(&config_json).await else {
             eprintln!("Skipping test: redis-server not available");
             return;
         };
@@ -2371,7 +2427,7 @@ mod tests {
         }}"#
         );
 
-        let Some((_server, steward, _client)) = setup_test_steward(&config_json) else {
+        let Some((_server, steward, _client)) = setup_test_steward(&config_json).await else {
             eprintln!("Skipping test: redis-server not available");
             return;
         };
@@ -2557,7 +2613,7 @@ mod tests {
         }}"#
         );
 
-        let Some((_server, steward, client)) = setup_test_steward(&config_json) else {
+        let Some((_server, steward, client)) = setup_test_steward(&config_json).await else {
             eprintln!("Skipping test: redis-server not available");
             return;
         };
@@ -2668,7 +2724,7 @@ mod tests {
         }}"#
         );
 
-        let Some((_server, steward, _client)) = setup_test_steward(&config_json) else {
+        let Some((_server, steward, _client)) = setup_test_steward(&config_json).await else {
             eprintln!("Skipping test: redis-server not available");
             return;
         };
@@ -2768,7 +2824,7 @@ mod tests {
         }}"#
         );
 
-        let Some((_server, steward, client)) = setup_test_steward(&config_json) else {
+        let Some((_server, steward, client)) = setup_test_steward(&config_json).await else {
             eprintln!("Skipping test: redis-server not available");
             return;
         };
@@ -2856,7 +2912,7 @@ mod tests {
         }}"#
         );
 
-        let Some((_server, steward, client)) = setup_test_steward(&config_json) else {
+        let Some((_server, steward, client)) = setup_test_steward(&config_json).await else {
             eprintln!("Skipping test: redis-server not available");
             return;
         };
@@ -2985,9 +3041,12 @@ mod tests {
         };
 
         let client = redis::Client::open(format!("redis://127.0.0.1:{port}")).unwrap();
-        let pool = r2d2::Pool::builder()
-            .connection_timeout(std::time::Duration::from_millis(150))
-            .build(client)
+        let mut config = redis::aio::ConnectionManagerConfig::new();
+        config = config.set_connection_timeout(Some(std::time::Duration::from_millis(150)));
+        config = config.set_response_timeout(Some(std::time::Duration::from_millis(150)));
+        config = config.set_number_of_retries(1);
+        let redis = redis::aio::ConnectionManager::new_with_config(client, config)
+            .await
             .unwrap();
 
         let domain = "domain_kill_test";
@@ -3010,12 +3069,13 @@ mod tests {
         let (_tx, rx) = tokio::sync::watch::channel(compiled);
         let steward = super::Steward {
             config_rx: rx,
-            redis_pool: pool,
+            redis,
             default_ttl: 10,
             metrics: std::sync::Arc::new(cadence::StatsdClient::from_sink(
                 "",
                 cadence::NopMetricSink,
             )),
+            scripts: super::StewardScripts::default(),
         };
 
         let make_req = || RateLimitRequest {

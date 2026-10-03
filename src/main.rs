@@ -53,9 +53,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         settings.redis_host.as_str(),
         settings.default_ttl,
         config_rx,
-        settings.redis_connections.unwrap_or(1),
         metrics,
-    )?;
+    )
+    .await?;
 
     let addr = SocketAddr::new(settings.listen.addr.into(), settings.listen.port);
     let socket = Socket::new(Domain::for_address(addr), Type::STREAM, None)?;
