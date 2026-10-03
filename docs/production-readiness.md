@@ -377,7 +377,7 @@ Milestones are dependency ordered. Each should leave a deployable development pr
 
 - [x] **M4.1:** Run the complete correctness/protocol matrix against the selected Envoy and Redis versions and the release image. Results published in [docs/release-qualification/correctness-matrix-results.md](release-qualification/correctness-matrix-results.md).
 - [x] **M4.2:** Run offered-load sweeps, hot-key/high-cardinality tests, maximum supported sliding work, a six-hour soak, and an agreed burst scenario. Results published in [docs/release-qualification/load-and-soak-results.md](release-qualification/load-and-soak-results.md).
-- [ ] **M4.3:** Run backend delay/blackhole, network disconnect, primary failover, `NOSCRIPT`, configuration outage/rejection, telemetry failure, and rolling-drain scenarios under load. Quantify bypasses and state loss.
+- [x] **M4.3:** Run backend delay/blackhole, network disconnect, primary failover, `NOSCRIPT`, configuration outage/rejection, telemetry failure, and rolling-drain scenarios under load. Results published in [docs/release-qualification/chaos-and-resilience-results.md](release-qualification/chaos-and-resilience-results.md).
 - [ ] **M4.4:** Run a canary with predefined stop conditions for latency, enforcement error/bypass rate, policy divergence, and Redis saturation. Observe at least a full quota window for relevant policies or obtain equivalent targeted evidence for long windows.
 - [ ] **M4.5:** Record supported operating envelope, remaining limitations, production ownership, and release/rollback procedures. Release only when all P0 findings and applicable P1 gates are closed or the corresponding capability is explicitly excluded.
 
