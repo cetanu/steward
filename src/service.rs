@@ -83,7 +83,7 @@ pub fn generate_sliding_window_nonce() -> String {
         .expect("system randomness failed to generate nonce");
     let mut hex = String::with_capacity(32);
     for b in bytes {
-        let _ = std::fmt::write(&mut hex, format_args!("{:02x}", b));
+        let _ = std::fmt::write(&mut hex, format_args!("{b:02x}"));
     }
     hex
 }
@@ -3890,8 +3890,7 @@ mod tests {
         assert_eq!(err.message(), "request execution deadline exceeded");
         assert!(
             elapsed < std::time::Duration::from_millis(500),
-            "elapsed was {:?}",
-            elapsed
+            "elapsed was {elapsed:?}"
         );
 
         // 2. Test grpc-timeout header parsing and enforcement (e.g. 5m -> effective 3ms)
@@ -3910,8 +3909,7 @@ mod tests {
         assert_eq!(err.message(), "request execution deadline exceeded");
         assert!(
             elapsed < std::time::Duration::from_millis(500),
-            "elapsed was {:?}",
-            elapsed
+            "elapsed was {elapsed:?}"
         );
 
         // Unpause Redis and kill server
