@@ -355,7 +355,7 @@ Milestones are dependency ordered. Each should leave a deployable development pr
 - [x] **M2.2:** Enforce RPC/backend/admission deadlines, global concurrency and queue bounds, Tonic message/stream limits, and explicit Envoy RPC timeouts. Verify ambiguous timeout behavior without blind mutation retries.
 - [x] **M2.3:** Implement authoritative time and globally unique sliding events. Enforce numeric, event, pruning, and hit-cost limits. Remove unchecked short-array defaults for script outcomes.
 - [x] **M2.4:** Certify token and sliding reference models, boundaries, weighted costs/refunds within supported scope, concurrency, clock regression, expiry, capacity edits, and two-replica behavior. Include Redis cardinality/state assertions.
-- [ ] **M2.5:** Evaluate bounded concurrent calls or pipelining for multiple rules; implement and test script-cache recovery for the chosen path. Profile matching allocations and snapshot cloning before adding further data structures.
+- [x] **M2.5:** Evaluate bounded concurrent calls or pipelining for multiple rules; implement and test script-cache recovery for the chosen path. Profile matching allocations and snapshot cloning before adding further data structures.
 - [ ] **M2.6:** Instrument end-to-end latency, backend phases, outcomes, admission, and in-flight work. Remove routine INFO/WARN decision logging from the high-volume path and guard telemetry error reporting.
 - [ ] **M2.7:** Build a reproducible load harness and publish baseline/updated results for all advertised algorithms, descriptor counts, key skews, and hit costs. Publish saturation, supported load, and service/Redis profiles.
 
