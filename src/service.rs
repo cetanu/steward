@@ -128,6 +128,139 @@ impl From<ScriptOutcome> for Decision {
     }
 }
 
+/// Pure reference model for Token Bucket rate limiting.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TokenBucketReference {
+    pub capacity: f64,
+    pub refill_per_ms: f64,
+    pub window_ms: u64,
+    pub tokens: f64,
+    pub last_timestamp_ms: Option<u64>,
+}
+
+impl TokenBucketReference {
+    pub fn new(capacity: f64, window_ms: u64) -> Self {
+        let refill_per_ms = capacity / (window_ms.max(1) as f64);
+        Self {
+            capacity,
+            refill_per_ms,
+            window_ms,
+            tokens: capacity,
+            last_timestamp_ms: None,
+        }
+    }
+
+    pub fn update_capacity(&mut self, new_capacity: f64) {
+        self.capacity = new_capacity;
+        self.refill_per_ms = new_capacity / (self.window_ms.max(1) as f64);
+        if self.tokens > self.capacity {
+            self.tokens = self.capacity;
+        }
+    }
+
+    /// Advance time and consume `cost` tokens if available.
+    /// Returns `(allowed, observed_tokens)` matching the Redis Lua script.
+    pub fn consume(&mut self, now_ms: u64, cost: u64) -> (bool, i64) {
+        let mut effective_now_ms = now_ms;
+        if let Some(last) = self.last_timestamp_ms {
+            if effective_now_ms < last {
+                effective_now_ms = last;
+            }
+            let elapsed = effective_now_ms.saturating_sub(last);
+            self.tokens = (self.tokens + (elapsed as f64 * self.refill_per_ms)).min(self.capacity);
+        } else {
+            self.tokens = self.capacity;
+        }
+
+        let allowed = self.tokens >= cost as f64;
+        if allowed {
+            self.tokens -= cost as f64;
+        }
+        self.last_timestamp_ms = Some(effective_now_ms);
+        (allowed, self.tokens.floor() as i64)
+    }
+
+    /// Advance time and refund `refund_amount` tokens.
+    /// Returns `(true, observed_tokens)` matching the Redis Lua script.
+    pub fn refund(&mut self, now_ms: u64, refund_amount: u64) -> (bool, i64) {
+        let mut effective_now_ms = now_ms;
+        if let Some(last) = self.last_timestamp_ms {
+            if effective_now_ms < last {
+                effective_now_ms = last;
+            }
+            let elapsed = effective_now_ms.saturating_sub(last);
+            self.tokens = (self.tokens + (elapsed as f64 * self.refill_per_ms)).min(self.capacity);
+        } else {
+            self.tokens = self.capacity;
+        }
+
+        self.tokens = (self.tokens + refund_amount as f64).min(self.capacity);
+        self.last_timestamp_ms = Some(effective_now_ms);
+        (true, self.tokens.floor() as i64)
+    }
+}
+
+/// Pure reference model for Sliding Window rate limiting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlidingWindowReference {
+    pub window_ms: u64,
+    pub limit: u64,
+    pub max_retention: usize,
+    /// Vector of (timestamp_ms, member_string) in insertion order
+    pub events: Vec<(u64, String)>,
+}
+
+impl SlidingWindowReference {
+    pub const DEFAULT_MAX_RETENTION: usize = 10_000;
+
+    pub fn new(window_ms: u64, limit: u64) -> Self {
+        Self {
+            window_ms,
+            limit,
+            max_retention: Self::DEFAULT_MAX_RETENTION,
+            events: Vec::new(),
+        }
+    }
+
+    pub fn evict_expired(&mut self, now_ms: u64) {
+        if now_ms > self.window_ms {
+            let cutoff = now_ms - self.window_ms;
+            self.events.retain(|(ts, _)| *ts > cutoff);
+        }
+    }
+
+    /// Attempt to consume `hits` events.
+    /// Returns `(allowed, current_count)` matching the Redis Lua script.
+    pub fn consume(&mut self, now_ms: u64, now_usec: u64, nonce: &str, hits: u64) -> (bool, i64) {
+        if !(1..=100).contains(&hits) {
+            return (false, 0);
+        }
+
+        self.evict_expired(now_ms);
+        let current = self.events.len() as u64;
+
+        if current + hits <= self.limit {
+            for i in 1..=hits {
+                let member = format!("{now_usec}:{nonce}:{i}");
+                self.events.push((now_ms, member));
+            }
+            let mut new_current = current + hits;
+            if self.events.len() > self.max_retention {
+                let excess = self.events.len() - self.max_retention;
+                self.events.drain(0..excess);
+                new_current = self.max_retention as u64;
+            }
+            (true, new_current as i64)
+        } else {
+            (false, current as i64)
+        }
+    }
+
+    pub fn count(&self) -> usize {
+        self.events.len()
+    }
+}
+
 struct DescriptorMatch {
     limits_to_check: Vec<(String, RateLimit)>,
     operation: HitOperation,
@@ -4107,5 +4240,1153 @@ mod tests {
         let decision: super::Decision = outcome.into();
         assert_eq!(decision.allowed, outcome.allowed);
         assert_eq!(decision.observed, outcome.observed);
+    }
+
+    #[test]
+    fn test_reference_models_pure_logic() {
+        use super::{SlidingWindowReference, TokenBucketReference};
+
+        // 1. TokenBucketReference logic
+        let mut tb = TokenBucketReference::new(10.0, 10_000);
+        assert_eq!(tb.capacity, 10.0);
+        assert_eq!(tb.refill_per_ms, 0.001);
+
+        // Initial hit of 4 tokens at t = 1000ms
+        let (allowed, observed) = tb.consume(1000, 4);
+        assert!(allowed);
+        assert_eq!(observed, 6);
+
+        // Simulated backward clock shift to t = 500ms
+        // Clock clamping prevents backward movement and elapsed becomes 0
+        let (allowed, observed) = tb.consume(500, 2);
+        assert!(allowed);
+        assert_eq!(observed, 4);
+        assert_eq!(tb.last_timestamp_ms, Some(1000));
+
+        // Consume remaining 4 tokens at t = 1000ms
+        let (allowed, observed) = tb.consume(1000, 4);
+        assert!(allowed);
+        assert_eq!(observed, 0);
+
+        // Capacity exhausted, request for 1 token denied
+        let (allowed, observed) = tb.consume(1000, 1);
+        assert!(!allowed);
+        assert_eq!(observed, 0);
+
+        // Continuous fractional refill: advance by 3000ms (3 tokens refilled)
+        let (allowed, observed) = tb.consume(4000, 2);
+        assert!(allowed);
+        assert_eq!(observed, 1);
+
+        // Refund 5 tokens (capped at capacity 10.0)
+        let (refunded, observed) = tb.refund(4000, 5);
+        assert!(refunded);
+        assert_eq!(observed, 6);
+
+        // Dynamic capacity update
+        tb.update_capacity(20.0);
+        assert_eq!(tb.capacity, 20.0);
+        assert_eq!(tb.refill_per_ms, 0.002);
+
+        // 2. SlidingWindowReference logic
+        let mut sw = SlidingWindowReference::new(5_000, 5);
+        assert_eq!(sw.count(), 0);
+
+        // Insert 3 hits at t = 1000ms
+        let (allowed, count) = sw.consume(1000, 1_000_000, "nonce1", 3);
+        assert!(allowed);
+        assert_eq!(count, 3);
+
+        // Insert 2 hits at t = 2000ms (reaches limit 5)
+        let (allowed, count) = sw.consume(2000, 2_000_000, "nonce2", 2);
+        assert!(allowed);
+        assert_eq!(count, 5);
+
+        // Exceed limit
+        let (allowed, count) = sw.consume(3000, 3_000_000, "nonce3", 1);
+        assert!(!allowed);
+        assert_eq!(count, 5);
+
+        // Advance time past 1000ms window (> 6000ms): 3 hits at t=1000ms expire
+        let (allowed, count) = sw.consume(6001, 6_001_000, "nonce4", 2);
+        assert!(allowed);
+        // Remaining 2 from t=2000ms + 2 new = 4
+        assert_eq!(count, 4);
+
+        // Max retention cap
+        let mut sw_cap = SlidingWindowReference::new(10_000, 20);
+        sw_cap.max_retention = 5;
+        let (allowed, count) = sw_cap.consume(1000, 1_000_000, "n1", 4);
+        assert!(allowed);
+        assert_eq!(count, 4);
+        let (allowed, count) = sw_cap.consume(2000, 2_000_000, "n2", 3);
+        assert!(allowed);
+        assert_eq!(count, 5); // Clamped at 5
+        assert_eq!(sw_cap.count(), 5);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_token_bucket_certification_capacity_exhaustion() {
+        use super::{HitOperation, TokenBucketReference};
+        use crate::rate_limits::{encode_canonical_path, rate_limit_key};
+
+        let domain = "tb_cert_exhaustion";
+        let config_json = format!(
+            r#"{{
+            "domain": "{domain}",
+            "descriptors": [
+                {{
+                    "key": "action",
+                    "value": "burn",
+                    "rate_limit": {{ "algorithm": "token_bucket", "unit": "seconds", "requests_per_unit": 10 }}
+                }}
+            ]
+        }}"#
+        );
+
+        let Some((_server, steward, client)) = setup_test_steward(&config_json).await else {
+            eprintln!("Skipping test: redis-server not available");
+            return;
+        };
+
+        let mut conn = client.get_connection().unwrap();
+        let active_cfg = steward.active_config();
+        let domain_policy = active_cfg.domains.get(domain).unwrap();
+        let matched = domain_policy.match_entries(&[("action", "burn")]).unwrap();
+        let limit = matched.rate_limits[0];
+        let path = encode_canonical_path([("action", "burn")]);
+        let key = rate_limit_key(domain, matched.policy_id, &path, &limit, 10);
+
+        let mut ref_model = TokenBucketReference::new(10.0, 10_000);
+
+        // 1. Consume 10 tokens in sequence (10 hits of cost 1)
+        for i in 1..=10 {
+            let decision = steward
+                .check_limit(&key, &limit, HitOperation::Consume(1))
+                .await
+                .unwrap();
+            let (ref_allowed, ref_observed) = ref_model.consume(0, 1);
+
+            assert!(decision.allowed, "hit {i} must be allowed");
+            assert!(ref_allowed, "reference hit {i} must be allowed");
+            assert_eq!(
+                decision.observed,
+                (10 - i) as i64,
+                "observed tokens must match"
+            );
+            assert_eq!(decision.observed, ref_observed);
+        }
+
+        // 2. Capacity exhaustion: 11th hit (capacity + 1) must be rejected
+        let decision_exhausted = steward
+            .check_limit(&key, &limit, HitOperation::Consume(1))
+            .await
+            .unwrap();
+        let (ref_allowed_11, ref_observed_11) = ref_model.consume(0, 1);
+        assert!(
+            !decision_exhausted.allowed,
+            "11th hit must be rejected when bucket is exhausted"
+        );
+        assert!(!ref_allowed_11);
+        assert_eq!(decision_exhausted.observed, 0);
+        assert_eq!(ref_observed_11, 0);
+
+        // 3. Direct Redis state assertions
+        let state: (Option<f64>, Option<i64>) = redis::cmd("HMGET")
+            .arg(&key)
+            .arg("tokens")
+            .arg("timestamp_ms")
+            .query(&mut conn)
+            .unwrap();
+        let stored_tokens = state.0.expect("tokens field must exist in Redis");
+        let stored_ts = state.1.expect("timestamp_ms field must exist in Redis");
+        assert!(
+            stored_tokens < 0.05,
+            "stored tokens in Redis must be ~0, got {stored_tokens}"
+        );
+        assert!(stored_ts > 0, "stored timestamp_ms must be positive");
+
+        let pttl: i64 = redis::cmd("PTTL").arg(&key).query(&mut conn).unwrap();
+        assert!(
+            pttl > 0 && pttl <= 20_000,
+            "PTTL must be positive and bounded by 2 * window_ms (20000ms), got {pttl}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_token_bucket_certification_fractional_refill_over_time() {
+        use super::{HitOperation, TokenBucketReference};
+        use crate::rate_limits::{encode_canonical_path, rate_limit_key};
+
+        let domain = "tb_cert_refill";
+        let config_json = format!(
+            r#"{{
+            "domain": "{domain}",
+            "descriptors": [
+                {{
+                    "key": "action",
+                    "value": "refill",
+                    "rate_limit": {{ "algorithm": "token_bucket", "unit": "seconds", "requests_per_unit": 10 }}
+                }}
+            ]
+        }}"#
+        );
+
+        let Some((_server, steward, client)) = setup_test_steward(&config_json).await else {
+            eprintln!("Skipping test: redis-server not available");
+            return;
+        };
+
+        let mut conn = client.get_connection().unwrap();
+        let active_cfg = steward.active_config();
+        let domain_policy = active_cfg.domains.get(domain).unwrap();
+        let matched = domain_policy
+            .match_entries(&[("action", "refill")])
+            .unwrap();
+        let limit = matched.rate_limits[0];
+        let path = encode_canonical_path([("action", "refill")]);
+        let key = rate_limit_key(domain, matched.policy_id, &path, &limit, 10);
+
+        let mut ref_model = TokenBucketReference::new(10.0, 1_000);
+
+        // 1. Exhaust all 10 tokens in burst
+        let d = steward
+            .check_limit(&key, &limit, HitOperation::Consume(10))
+            .await
+            .unwrap();
+        assert!(d.allowed);
+        assert_eq!(d.observed, 0);
+
+        // 2. Fetch authoritative Redis time
+        let redis_time: (i64, i64) = redis::cmd("TIME").query(&mut conn).unwrap();
+        let now_ms = (redis_time.0 * 1000) + (redis_time.1 / 1000);
+
+        // 3. Simulate exactly 50% window elapsed (500ms on 1,000ms window)
+        // With capacity 10 and window 1s, refill rate is 10 tokens/sec (0.01 tokens/ms).
+        // 500ms elapsed refills exactly 5.0 tokens.
+        let elapsed_50 = 500;
+        let past_ts_50 = now_ms - elapsed_50;
+        let _: () = redis::cmd("HSET")
+            .arg(&key)
+            .arg("tokens")
+            .arg(0.0)
+            .arg("timestamp_ms")
+            .arg(past_ts_50)
+            .query(&mut conn)
+            .unwrap();
+        ref_model.last_timestamp_ms = Some(past_ts_50 as u64);
+        ref_model.tokens = 0.0;
+
+        // Consume 5 tokens: must be allowed (refilled exactly 5 tokens)
+        let d_50 = steward
+            .check_limit(&key, &limit, HitOperation::Consume(5))
+            .await
+            .unwrap();
+        let (ref_allowed_50, ref_obs_50) = ref_model.consume(now_ms as u64, 5);
+        assert!(d_50.allowed, "50% window elapsed must allow 5 tokens");
+        assert!(ref_allowed_50);
+        assert_eq!(d_50.observed, 0);
+        assert_eq!(ref_obs_50, 0);
+
+        // Next 1 token immediately must be rejected (0 tokens left)
+        let d_reject = steward
+            .check_limit(&key, &limit, HitOperation::Consume(1))
+            .await
+            .unwrap();
+        let (ref_allowed_rej, ref_obs_rej) = ref_model.consume(now_ms as u64, 1);
+        assert!(!d_reject.allowed);
+        assert!(!ref_allowed_rej);
+        assert_eq!(d_reject.observed, 0);
+        assert_eq!(ref_obs_rej, 0);
+
+        // 4. Simulate another 30% window elapsed (300ms)
+        let redis_time2: (i64, i64) = redis::cmd("TIME").query(&mut conn).unwrap();
+        let now_ms2 = (redis_time2.0 * 1000) + (redis_time2.1 / 1000);
+        let past_ts_30 = now_ms2 - 300;
+        let _: () = redis::cmd("HSET")
+            .arg(&key)
+            .arg("tokens")
+            .arg(0.0)
+            .arg("timestamp_ms")
+            .arg(past_ts_30)
+            .query(&mut conn)
+            .unwrap();
+        ref_model.last_timestamp_ms = Some(past_ts_30 as u64);
+        ref_model.tokens = 0.0;
+
+        let d_30 = steward
+            .check_limit(&key, &limit, HitOperation::Consume(3))
+            .await
+            .unwrap();
+        let (ref_allowed_30, ref_obs_30) = ref_model.consume(now_ms2 as u64, 3);
+        assert!(d_30.allowed, "30% window elapsed must allow 3 tokens");
+        assert!(ref_allowed_30);
+        assert_eq!(d_30.observed, 0);
+        assert_eq!(ref_obs_30, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_token_bucket_certification_dynamic_capacity_update_live_keys() {
+        use super::{HitOperation, TokenBucketReference};
+        use crate::rate_limits::{encode_canonical_path, rate_limit_key};
+
+        let domain = "tb_cert_dynamic_capacity";
+        let config_initial = format!(
+            r#"{{
+            "domain": "{domain}",
+            "descriptors": [
+                {{
+                    "key": "tier",
+                    "value": "standard",
+                    "rate_limit": {{ "algorithm": "token_bucket", "unit": "seconds", "requests_per_unit": 5 }}
+                }}
+            ]
+        }}"#
+        );
+
+        let Some((_server, steward, client)) = setup_test_steward(&config_initial).await else {
+            eprintln!("Skipping test: redis-server not available");
+            return;
+        };
+
+        let mut conn = client.get_connection().unwrap();
+        let active_cfg = steward.active_config();
+        let domain_policy = active_cfg.domains.get(domain).unwrap();
+        let matched = domain_policy
+            .match_entries(&[("tier", "standard")])
+            .unwrap();
+        let initial_limit = matched.rate_limits[0];
+        let path = encode_canonical_path([("tier", "standard")]);
+        let initial_key = rate_limit_key(domain, matched.policy_id, &path, &initial_limit, 10);
+
+        let mut ref_model = TokenBucketReference::new(5.0, 1_000);
+
+        // 1. Exhaust initial capacity of 5
+        let d1 = steward
+            .check_limit(&initial_key, &initial_limit, HitOperation::Consume(5))
+            .await
+            .unwrap();
+        assert!(d1.allowed);
+        assert_eq!(d1.observed, 0);
+
+        // Verify key exists in Redis
+        let exists: bool = redis::cmd("EXISTS")
+            .arg(&initial_key)
+            .query(&mut conn)
+            .unwrap();
+        assert!(exists);
+
+        // 2. Define updated limit with capacity 20 (same domain, policy ID, path, algorithm, unit)
+        let updated_limit = crate::rate_limits::RateLimit {
+            requests_per_unit: 20,
+            unit: initial_limit.unit,
+            algorithm: initial_limit.algorithm,
+        };
+        let updated_key = rate_limit_key(domain, matched.policy_id, &path, &updated_limit, 10);
+
+        // Counter identity is preserved across threshold changes!
+        assert_eq!(
+            initial_key, updated_key,
+            "counter key identity must remain identical when capacity threshold changes"
+        );
+
+        // Update reference model capacity
+        ref_model.update_capacity(20.0);
+        assert_eq!(ref_model.capacity, 20.0);
+        assert_eq!(ref_model.refill_per_ms, 0.02);
+
+        // 3. Simulate 50% window elapsed (500ms on 1000ms window):
+        // Under new capacity 20, 50% window refills 500 * 0.02 = 10.0 tokens!
+        let redis_time: (i64, i64) = redis::cmd("TIME").query(&mut conn).unwrap();
+        let now_ms = (redis_time.0 * 1000) + (redis_time.1 / 1000);
+        let past_ts = now_ms - 500;
+        let _: () = redis::cmd("HSET")
+            .arg(&updated_key)
+            .arg("tokens")
+            .arg(0.0)
+            .arg("timestamp_ms")
+            .arg(past_ts)
+            .query(&mut conn)
+            .unwrap();
+        ref_model.last_timestamp_ms = Some(past_ts as u64);
+        ref_model.tokens = 0.0;
+
+        // Under old capacity of 5, consuming 8 tokens would be impossible (capacity is only 5).
+        // Under new capacity of 20, 10 tokens refilled >= 8 cost -> ALLOWED!
+        let d_new = steward
+            .check_limit(&updated_key, &updated_limit, HitOperation::Consume(8))
+            .await
+            .unwrap();
+        let (ref_allowed, ref_observed) = ref_model.consume(now_ms as u64, 8);
+        assert!(d_new.allowed, "new capacity of 20 must allow 8 tokens");
+        assert!(ref_allowed);
+        assert_eq!(d_new.observed, 2);
+        assert_eq!(ref_observed, 2);
+
+        // Direct Redis state assertions
+        let tokens_in_redis: f64 = redis::cmd("HGET")
+            .arg(&updated_key)
+            .arg("tokens")
+            .query(&mut conn)
+            .unwrap();
+        assert!(
+            (tokens_in_redis - 2.0).abs() < 0.1,
+            "Redis must hold ~2 tokens, got {tokens_in_redis}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_token_bucket_certification_clock_drift_and_backward_shift_protection() {
+        use super::{HitOperation, TokenBucketReference};
+        use crate::rate_limits::{encode_canonical_path, rate_limit_key};
+
+        let domain = "tb_cert_clock_drift";
+        let config_json = format!(
+            r#"{{
+            "domain": "{domain}",
+            "descriptors": [
+                {{
+                    "key": "action",
+                    "value": "clock_test",
+                    "rate_limit": {{ "algorithm": "token_bucket", "unit": "seconds", "requests_per_unit": 10 }}
+                }}
+            ]
+        }}"#
+        );
+
+        let Some((_server, steward, client)) = setup_test_steward(&config_json).await else {
+            eprintln!("Skipping test: redis-server not available");
+            return;
+        };
+
+        let mut conn = client.get_connection().unwrap();
+        let active_cfg = steward.active_config();
+        let domain_policy = active_cfg.domains.get(domain).unwrap();
+        let matched = domain_policy
+            .match_entries(&[("action", "clock_test")])
+            .unwrap();
+        let limit = matched.rate_limits[0];
+        let path = encode_canonical_path([("action", "clock_test")]);
+        let key = rate_limit_key(domain, matched.policy_id, &path, &limit, 10);
+
+        let mut ref_model = TokenBucketReference::new(10.0, 10_000);
+
+        // Consume 7 tokens -> 3 tokens remaining
+        let d1 = steward
+            .check_limit(&key, &limit, HitOperation::Consume(7))
+            .await
+            .unwrap();
+        let (ref_all_1, ref_obs_1) = ref_model.consume(0, 7);
+        assert!(d1.allowed);
+        assert!(ref_all_1);
+        assert_eq!(d1.observed, 3);
+        assert_eq!(ref_obs_1, 3);
+
+        // Read Redis timestamp
+        let redis_time: (i64, i64) = redis::cmd("TIME").query(&mut conn).unwrap();
+        let now_ms = (redis_time.0 * 1000) + (redis_time.1 / 1000);
+
+        // Simulate severe backward clock drift (e.g. Redis NTP step or failover clock shift 60s into future)
+        let future_ts = now_ms + 60_000;
+        let _: () = redis::cmd("HSET")
+            .arg(&key)
+            .arg("tokens")
+            .arg(3.0)
+            .arg("timestamp_ms")
+            .arg(future_ts)
+            .query(&mut conn)
+            .unwrap();
+        ref_model.last_timestamp_ms = Some(future_ts as u64);
+        ref_model.tokens = 3.0;
+
+        // Attempt consuming 4 tokens when Redis server time is still ~now_ms (< future_ts)
+        // With clock drift protection, now_ms is clamped to future_ts, elapsed is 0, no refill happens!
+        // 3 tokens < 4 cost -> must be rejected
+        let d_reject = steward
+            .check_limit(&key, &limit, HitOperation::Consume(4))
+            .await
+            .unwrap();
+        let (ref_all_rej, ref_obs_rej) = ref_model.consume(now_ms as u64, 4);
+        assert!(
+            !d_reject.allowed,
+            "4 tokens must be rejected when only 3 tokens remain"
+        );
+        assert!(!ref_all_rej);
+        assert_eq!(d_reject.observed, 3);
+        assert_eq!(ref_obs_rej, 3);
+
+        // Consume 2 tokens: 3 tokens >= 2 cost -> allowed, leaves 1 token
+        let d_allow = steward
+            .check_limit(&key, &limit, HitOperation::Consume(2))
+            .await
+            .unwrap();
+        let (ref_all_allow, ref_obs_allow) = ref_model.consume(now_ms as u64, 2);
+        assert!(d_allow.allowed);
+        assert!(ref_all_allow);
+        assert_eq!(d_allow.observed, 1);
+        assert_eq!(ref_obs_allow, 1);
+
+        // Stored timestamp must NOT regress backwards to now_ms
+        let state: (Option<f64>, Option<i64>) = redis::cmd("HMGET")
+            .arg(&key)
+            .arg("tokens")
+            .arg("timestamp_ms")
+            .query(&mut conn)
+            .unwrap();
+        assert!(
+            state.1.unwrap() >= future_ts,
+            "stored timestamp must remain clamped to future_ts"
+        );
+        assert!(
+            (state.0.unwrap() - 1.0).abs() < 0.1,
+            "stored tokens must be ~1"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_token_bucket_certification_direct_redis_state_and_refunds() {
+        use super::{HitOperation, TokenBucketReference};
+        use crate::rate_limits::{encode_canonical_path, rate_limit_key};
+
+        let domain = "tb_cert_state_refunds";
+        let config_json = format!(
+            r#"{{
+            "domain": "{domain}",
+            "descriptors": [
+                {{
+                    "key": "action",
+                    "value": "refund_test",
+                    "rate_limit": {{ "algorithm": "token_bucket", "unit": "seconds", "requests_per_unit": 10 }}
+                }}
+            ]
+        }}"#
+        );
+
+        let Some((_server, steward, client)) = setup_test_steward(&config_json).await else {
+            eprintln!("Skipping test: redis-server not available");
+            return;
+        };
+
+        let mut conn = client.get_connection().unwrap();
+        let active_cfg = steward.active_config();
+        let domain_policy = active_cfg.domains.get(domain).unwrap();
+        let matched = domain_policy
+            .match_entries(&[("action", "refund_test")])
+            .unwrap();
+        let limit = matched.rate_limits[0];
+        let path = encode_canonical_path([("action", "refund_test")]);
+        let key = rate_limit_key(domain, matched.policy_id, &path, &limit, 10);
+
+        let mut ref_model = TokenBucketReference::new(10.0, 10_000);
+
+        // 1. Probe check: does not create key in Redis
+        let probe = steward
+            .check_limit(&key, &limit, HitOperation::Probe)
+            .await
+            .unwrap();
+        assert!(probe.allowed);
+        assert_eq!(probe.observed, 10);
+        let exists_before: bool = redis::cmd("EXISTS").arg(&key).query(&mut conn).unwrap();
+        assert!(!exists_before, "Probe check must not create key in Redis");
+
+        // 2. Consume 8 tokens
+        let d_consume = steward
+            .check_limit(&key, &limit, HitOperation::Consume(8))
+            .await
+            .unwrap();
+        let (ref_all, ref_obs) = ref_model.consume(0, 8);
+        assert!(d_consume.allowed);
+        assert!(ref_all);
+        assert_eq!(d_consume.observed, 2);
+        assert_eq!(ref_obs, 2);
+
+        // Direct state assertions
+        let key_type: String = redis::cmd("TYPE").arg(&key).query(&mut conn).unwrap();
+        assert_eq!(key_type, "hash");
+
+        let hexists_tokens: bool = redis::cmd("HEXISTS")
+            .arg(&key)
+            .arg("tokens")
+            .query(&mut conn)
+            .unwrap();
+        let hexists_ts: bool = redis::cmd("HEXISTS")
+            .arg(&key)
+            .arg("timestamp_ms")
+            .query(&mut conn)
+            .unwrap();
+        assert!(hexists_tokens);
+        assert!(hexists_ts);
+
+        let pttl: i64 = redis::cmd("PTTL").arg(&key).query(&mut conn).unwrap();
+        assert!(pttl > 0 && pttl <= 20_000);
+
+        // 3. Normal refund of 5 tokens: 2 + 5 = 7 tokens
+        let d_refund = steward
+            .check_limit(&key, &limit, HitOperation::Refund(5))
+            .await
+            .unwrap();
+        let (ref_ref_all, ref_ref_obs) = ref_model.refund(0, 5);
+        assert!(d_refund.allowed);
+        assert!(ref_ref_all);
+        assert_eq!(d_refund.observed, 7);
+        assert_eq!(ref_ref_obs, 7);
+
+        let tokens_after_refund: f64 = redis::cmd("HGET")
+            .arg(&key)
+            .arg("tokens")
+            .query(&mut conn)
+            .unwrap();
+        assert!((tokens_after_refund - 7.0).abs() < 0.1);
+
+        // 4. Excessive refund of 10 tokens: clamped to max capacity 10
+        let d_excess_refund = steward
+            .check_limit(&key, &limit, HitOperation::Refund(10))
+            .await
+            .unwrap();
+        let (ref_ex_all, ref_ex_obs) = ref_model.refund(0, 10);
+        assert!(d_excess_refund.allowed);
+        assert!(ref_ex_all);
+        assert_eq!(d_excess_refund.observed, 10);
+        assert_eq!(ref_ex_obs, 10);
+
+        let tokens_clamped: f64 = redis::cmd("HGET")
+            .arg(&key)
+            .arg("tokens")
+            .query(&mut conn)
+            .unwrap();
+        assert!((tokens_clamped - 10.0).abs() < 0.1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_sliding_window_certification_exact_log_boundary_expiry() {
+        use super::{HitOperation, SlidingWindowReference};
+        use crate::rate_limits::{encode_canonical_path, rate_limit_key};
+
+        let domain = "sw_cert_boundary";
+        let config_json = format!(
+            r#"{{
+            "domain": "{domain}",
+            "descriptors": [
+                {{
+                    "key": "action",
+                    "value": "boundary_test",
+                    "rate_limit": {{ "algorithm": "sliding_window", "unit": "minutes", "requests_per_unit": 5 }}
+                }}
+            ]
+        }}"#
+        );
+
+        let Some((_server, steward, client)) = setup_test_steward(&config_json).await else {
+            eprintln!("Skipping test: redis-server not available");
+            return;
+        };
+
+        let mut conn = client.get_connection().unwrap();
+        let active_cfg = steward.active_config();
+        let domain_policy = active_cfg.domains.get(domain).unwrap();
+        let matched = domain_policy
+            .match_entries(&[("action", "boundary_test")])
+            .unwrap();
+        let limit = matched.rate_limits[0];
+        let path = encode_canonical_path([("action", "boundary_test")]);
+        let key = rate_limit_key(domain, matched.policy_id, &path, &limit, 10);
+
+        let window_ms = 60_000;
+        let mut ref_model = SlidingWindowReference::new(window_ms, 5);
+
+        // Get Redis server time
+        let redis_time: (i64, i64) = redis::cmd("TIME").query(&mut conn).unwrap();
+        let now_ms = (redis_time.0 * 1000) + (redis_time.1 / 1000);
+
+        // Seed entries into Redis and reference model:
+        // - ev1: now_ms - 70_000 (score < now_ms - 60_000 -> expired)
+        // - ev2: now_ms - 60_000 (score == now_ms - 60_000 -> boundary, expired by ZREMRANGEBYSCORE)
+        // - ev3: now_ms - 50_000 (score > now_ms - 60_000 -> valid inside window!)
+        // - ev4: now_ms - 10_000 (valid inside window!)
+        let entries = vec![
+            (now_ms - 70_000, "ev_expired_1".to_string()),
+            (now_ms - 60_000, "ev_expired_2".to_string()),
+            (now_ms - 50_000, "ev_valid_3".to_string()),
+            (now_ms - 10_000, "ev_valid_4".to_string()),
+        ];
+
+        for (score, member) in &entries {
+            let _: () = redis::cmd("ZADD")
+                .arg(&key)
+                .arg(*score)
+                .arg(member)
+                .query(&mut conn)
+                .unwrap();
+        }
+        ref_model.events = entries
+            .iter()
+            .map(|(score, m)| (*score as u64, m.clone()))
+            .collect();
+
+        assert_eq!(
+            redis::cmd("ZCARD")
+                .arg(&key)
+                .query::<i64>(&mut conn)
+                .unwrap(),
+            4
+        );
+
+        // Consume 2 hits:
+        // Expired events ev1 and ev2 must be pruned. Valid events ev3 and ev4 remain (2 events).
+        // 2 remaining + 2 new hits = 4 <= 5 -> ALLOWED!
+        let d1 = steward
+            .check_limit(&key, &limit, HitOperation::Consume(2))
+            .await
+            .unwrap();
+        assert!(d1.allowed, "2 hits must be allowed");
+        assert_eq!(d1.observed, 4);
+
+        // Verify Redis ZCARD is exactly 4
+        let zcard1: i64 = redis::cmd("ZCARD").arg(&key).query(&mut conn).unwrap();
+        assert_eq!(zcard1, 4);
+
+        // Verify ev1 and ev2 were evicted from Redis
+        let s1: Option<f64> = redis::cmd("ZSCORE")
+            .arg(&key)
+            .arg("ev_expired_1")
+            .query(&mut conn)
+            .unwrap();
+        let s2: Option<f64> = redis::cmd("ZSCORE")
+            .arg(&key)
+            .arg("ev_expired_2")
+            .query(&mut conn)
+            .unwrap();
+        let s3: Option<f64> = redis::cmd("ZSCORE")
+            .arg(&key)
+            .arg("ev_valid_3")
+            .query(&mut conn)
+            .unwrap();
+        assert!(s1.is_none(), "ev_expired_1 must be evicted");
+        assert!(s2.is_none(), "ev_expired_2 must be evicted");
+        assert!(s3.is_some(), "ev_valid_3 must be retained");
+
+        // Now attempt consuming 2 more hits:
+        // Current = 4. 4 + 2 = 6 > 5 -> REJECTED!
+        let d2 = steward
+            .check_limit(&key, &limit, HitOperation::Consume(2))
+            .await
+            .unwrap();
+        assert!(
+            !d2.allowed,
+            "request for 2 hits when count=4 and limit=5 must be rejected"
+        );
+        assert_eq!(d2.observed, 4);
+
+        // Cardinality in Redis must remain 4 (denied calls do not insert events)
+        let zcard2: i64 = redis::cmd("ZCARD").arg(&key).query(&mut conn).unwrap();
+        assert_eq!(zcard2, 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_sliding_window_certification_multi_replica_concurrency() {
+        use super::HitOperation;
+        use crate::rate_limits::{encode_canonical_path, rate_limit_key};
+
+        let domain = "sw_cert_concurrency";
+        let config_json = format!(
+            r#"{{
+            "domain": "{domain}",
+            "descriptors": [
+                {{
+                    "key": "endpoint",
+                    "value": "concurrency_test",
+                    "rate_limit": {{ "algorithm": "sliding_window", "unit": "seconds", "requests_per_unit": 100 }}
+                }}
+            ]
+        }}"#
+        );
+
+        let Some((_server, steward, client)) = setup_test_steward(&config_json).await else {
+            eprintln!("Skipping test: redis-server not available");
+            return;
+        };
+
+        let mut conn = client.get_connection().unwrap();
+        let active_cfg = steward.active_config();
+        let domain_policy = active_cfg.domains.get(domain).unwrap();
+        let matched = domain_policy
+            .match_entries(&[("endpoint", "concurrency_test")])
+            .unwrap();
+        let limit = matched.rate_limits[0];
+        let path = encode_canonical_path([("endpoint", "concurrency_test")]);
+        let key = rate_limit_key(domain, matched.policy_id, &path, &limit, 10);
+
+        // Two simulated replicas: replica_a and replica_b
+        let replica_a = steward.clone();
+        let replica_b = steward.clone();
+
+        // 25 requests from replica_a with hits = 2 (50 hits total)
+        // 25 requests from replica_b with hits = 2 (50 hits total)
+        // Total = 100 hits, perfectly filling the limit of 100
+        let mut handles = Vec::new();
+
+        for _ in 0..25 {
+            let rep_a = replica_a.clone();
+            let k = key.clone();
+            let lim = limit;
+            handles.push(tokio::spawn(async move {
+                rep_a.check_limit(&k, &lim, HitOperation::Consume(2)).await
+            }));
+
+            let rep_b = replica_b.clone();
+            let k = key.clone();
+            let lim = limit;
+            handles.push(tokio::spawn(async move {
+                rep_b.check_limit(&k, &lim, HitOperation::Consume(2)).await
+            }));
+        }
+
+        // Await all 50 concurrent requests
+        for handle in handles {
+            let res = handle.await.unwrap().unwrap();
+            assert!(res.allowed, "concurrent hit must be allowed");
+        }
+
+        // Direct Redis state assertions:
+        // 1. Exact ZCARD matches sum of all hits: 50 requests * 2 hits = 100
+        let card: i64 = redis::cmd("ZCARD").arg(&key).query(&mut conn).unwrap();
+        assert_eq!(card, 100, "ZCARD in Redis must exactly equal 100");
+
+        // 2. Cardinality and membership: all 100 members must be completely unique with ZERO collisions
+        let members: Vec<String> = redis::cmd("ZRANGE")
+            .arg(&key)
+            .arg(0)
+            .arg(-1)
+            .query(&mut conn)
+            .unwrap();
+        assert_eq!(members.len(), 100);
+
+        let unique_members: std::collections::HashSet<_> = members.iter().cloned().collect();
+        assert_eq!(
+            unique_members.len(),
+            100,
+            "zero collisions across multi-replica concurrent writes"
+        );
+
+        // Extract nonces: exactly 50 distinct nonces (one per request)
+        let mut nonces = std::collections::HashSet::new();
+        for m in &members {
+            let parts: Vec<&str> = m.split(':').collect();
+            assert_eq!(parts.len(), 3, "member format must be <usec>:<nonce>:<i>");
+            assert!(parts[0].parse::<u64>().is_ok());
+            assert_eq!(parts[1].len(), 32);
+            let idx: u64 = parts[2].parse().unwrap();
+            assert!(idx == 1 || idx == 2);
+            nonces.insert(parts[1].to_string());
+        }
+        assert_eq!(
+            nonces.len(),
+            50,
+            "must have exactly 50 unique nonces across 50 requests"
+        );
+
+        // 3. Limit is now fully exhausted. Any subsequent request must be denied.
+        let d_over = replica_a
+            .check_limit(&key, &limit, HitOperation::Consume(1))
+            .await
+            .unwrap();
+        assert!(
+            !d_over.allowed,
+            "request beyond limit of 100 must be denied"
+        );
+        assert_eq!(d_over.observed, 100);
+
+        let final_card: i64 = redis::cmd("ZCARD").arg(&key).query(&mut conn).unwrap();
+        assert_eq!(final_card, 100, "denied request must not increment ZCARD");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_sliding_window_certification_cardinality_and_membership_format() {
+        use super::{HitOperation, SlidingWindowReference};
+        use crate::rate_limits::{encode_canonical_path, rate_limit_key};
+
+        let domain = "sw_cert_format";
+        let config_json = format!(
+            r#"{{
+            "domain": "{domain}",
+            "descriptors": [
+                {{
+                    "key": "action",
+                    "value": "format_test",
+                    "rate_limit": {{ "algorithm": "sliding_window", "unit": "minutes", "requests_per_unit": 50 }}
+                }}
+            ]
+        }}"#
+        );
+
+        let Some((_server, steward, client)) = setup_test_steward(&config_json).await else {
+            eprintln!("Skipping test: redis-server not available");
+            return;
+        };
+
+        let mut conn = client.get_connection().unwrap();
+        let active_cfg = steward.active_config();
+        let domain_policy = active_cfg.domains.get(domain).unwrap();
+        let matched = domain_policy
+            .match_entries(&[("action", "format_test")])
+            .unwrap();
+        let limit = matched.rate_limits[0];
+        let path = encode_canonical_path([("action", "format_test")]);
+        let key = rate_limit_key(domain, matched.policy_id, &path, &limit, 10);
+
+        let mut ref_model = SlidingWindowReference::new(60_000, 50);
+
+        // Check varying hits: 1, 3, 5, 2 (sum = 11 hits)
+        let hit_costs = vec![1, 3, 5, 2];
+        let mut running_sum = 0;
+        for hits in hit_costs {
+            let decision = steward
+                .check_limit(&key, &limit, HitOperation::Consume(hits))
+                .await
+                .unwrap();
+            running_sum += hits;
+            assert!(decision.allowed);
+            assert_eq!(decision.observed, running_sum as i64);
+
+            let (ref_all, ref_count) = ref_model.consume(0, 0, &format!("nonce_{hits}"), hits);
+            assert!(ref_all);
+            assert_eq!(ref_count, running_sum as i64);
+        }
+
+        // Direct Redis assertions:
+        // 1. ZCARD matches reference count: exactly 11
+        let card: i64 = redis::cmd("ZCARD").arg(&key).query(&mut conn).unwrap();
+        assert_eq!(card, 11);
+        assert_eq!(card as usize, ref_model.count());
+
+        // 2. Inspect members with scores
+        let members_with_scores: Vec<(String, f64)> = redis::cmd("ZRANGE")
+            .arg(&key)
+            .arg(0)
+            .arg(-1)
+            .arg("WITHSCORES")
+            .query(&mut conn)
+            .unwrap();
+        assert_eq!(members_with_scores.len(), 11);
+
+        let redis_time: (i64, i64) = redis::cmd("TIME").query(&mut conn).unwrap();
+        let now_ms = ((redis_time.0 * 1000) + (redis_time.1 / 1000)) as f64;
+
+        for (member, score) in members_with_scores {
+            // Score must match Redis TIME in milliseconds (within 5 seconds)
+            assert!(
+                (now_ms - score).abs() < 5000.0,
+                "score {score} must match Redis TIME ~{now_ms}"
+            );
+
+            // Member format: <usec>:<nonce>:<i>
+            let parts: Vec<&str> = member.split(':').collect();
+            assert_eq!(
+                parts.len(),
+                3,
+                "member {member} must have 3 colon-separated parts"
+            );
+
+            let usec: u64 = parts[0].parse().expect("part 0 must be u64 usec timestamp");
+            assert!(usec > 0);
+
+            let nonce = parts[1];
+            assert_eq!(nonce.len(), 32, "part 1 must be 32-hex-char nonce");
+            assert!(
+                nonce.chars().all(|c| c.is_ascii_hexdigit()),
+                "nonce must be valid hex"
+            );
+
+            let idx: u64 = parts[2].parse().expect("part 2 must be u64 hit index");
+            assert!(
+                (1..=5).contains(&idx),
+                "hit index must be between 1 and max hits (5)"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_sliding_window_certification_10000_event_retention_cap() {
+        use super::{HitOperation, SlidingWindowReference};
+        use crate::rate_limits::{encode_canonical_path, rate_limit_key};
+
+        let domain = "sw_cert_retention_cap";
+        let config_json = format!(
+            r#"{{
+            "domain": "{domain}",
+            "descriptors": [
+                {{
+                    "key": "action",
+                    "value": "cap_test",
+                    "rate_limit": {{ "algorithm": "sliding_window", "unit": "minutes", "requests_per_unit": 25000 }}
+                }}
+            ]
+        }}"#
+        );
+
+        let Some((_server, steward, client)) = setup_test_steward(&config_json).await else {
+            eprintln!("Skipping test: redis-server not available");
+            return;
+        };
+
+        let mut conn = client.get_connection().unwrap();
+        let active_cfg = steward.active_config();
+        let domain_policy = active_cfg.domains.get(domain).unwrap();
+        let matched = domain_policy
+            .match_entries(&[("action", "cap_test")])
+            .unwrap();
+        let limit = matched.rate_limits[0];
+        let path = encode_canonical_path([("action", "cap_test")]);
+        let key = rate_limit_key(domain, matched.policy_id, &path, &limit, 10);
+
+        let mut ref_model = SlidingWindowReference::new(60_000, 25_000);
+
+        // Fetch current Redis time
+        let redis_time: (i64, i64) = redis::cmd("TIME").query(&mut conn).unwrap();
+        let now_ms = (redis_time.0 * 1000) + (redis_time.1 / 1000);
+        let seed_score = now_ms - 2000;
+
+        // Seed 10,000 items in Redis
+        let mut cmd = redis::cmd("ZADD");
+        cmd.arg(&key);
+        for i in 0..10_000 {
+            cmd.arg(seed_score).arg(format!("seed_cert:{i:05}"));
+            ref_model
+                .events
+                .push((seed_score as u64, format!("seed_cert:{i:05}")));
+        }
+        let _: () = cmd.query(&mut conn).unwrap();
+        assert_eq!(
+            redis::cmd("ZCARD")
+                .arg(&key)
+                .query::<i64>(&mut conn)
+                .unwrap(),
+            10_000
+        );
+        assert_eq!(ref_model.count(), 10_000);
+
+        // Add 50 hits via sliding window script (limit is 25,000, so allowed)
+        // Set will temporarily reach 10,050 then be clamped to exactly 10,000 by ZREMRANGEBYRANK
+        let decision = steward
+            .check_limit(&key, &limit, HitOperation::Consume(50))
+            .await
+            .unwrap();
+        let (ref_all, ref_observed) = ref_model.consume(now_ms as u64, 0, "nonce_cap", 50);
+
+        assert!(decision.allowed);
+        assert_eq!(decision.observed, 10_000);
+        assert!(ref_all);
+        assert_eq!(ref_observed, 10_000);
+
+        // Redis cardinality must be strictly clamped to 10,000
+        let card: i64 = redis::cmd("ZCARD").arg(&key).query(&mut conn).unwrap();
+        assert_eq!(card, 10_000);
+        assert_eq!(ref_model.count(), 10_000);
+
+        // Verify oldest 50 items (seed_cert:00000 to seed_cert:00049) were evicted
+        for i in 0..50 {
+            let score: Option<f64> = redis::cmd("ZSCORE")
+                .arg(&key)
+                .arg(format!("seed_cert:{i:05}"))
+                .query(&mut conn)
+                .unwrap();
+            assert!(
+                score.is_none(),
+                "seed_cert:{i:05} must be evicted by rank cap"
+            );
+        }
+
+        // Verify item 50 was retained
+        let score_50: Option<f64> = redis::cmd("ZSCORE")
+            .arg(&key)
+            .arg("seed_cert:00050")
+            .query(&mut conn)
+            .unwrap();
+        assert!(score_50.is_some(), "seed_cert:00050 must be retained");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_sliding_window_certification_direct_redis_state_and_refunds() {
+        use super::HitOperation;
+        use crate::rate_limits::{encode_canonical_path, rate_limit_key};
+
+        let domain = "sw_cert_state_refunds";
+        let config_json = format!(
+            r#"{{
+            "domain": "{domain}",
+            "descriptors": [
+                {{
+                    "key": "action",
+                    "value": "state_test",
+                    "rate_limit": {{ "algorithm": "sliding_window", "unit": "seconds", "requests_per_unit": 10 }}
+                }}
+            ]
+        }}"#
+        );
+
+        let Some((_server, steward, client)) = setup_test_steward(&config_json).await else {
+            eprintln!("Skipping test: redis-server not available");
+            return;
+        };
+
+        let mut conn = client.get_connection().unwrap();
+        let active_cfg = steward.active_config();
+        let domain_policy = active_cfg.domains.get(domain).unwrap();
+        let matched = domain_policy
+            .match_entries(&[("action", "state_test")])
+            .unwrap();
+        let limit = matched.rate_limits[0];
+        let path = encode_canonical_path([("action", "state_test")]);
+        let key = rate_limit_key(domain, matched.policy_id, &path, &limit, 10);
+
+        // 1. Probe check: does not create key in Redis
+        let probe = steward
+            .check_limit(&key, &limit, HitOperation::Probe)
+            .await
+            .unwrap();
+        assert!(probe.allowed);
+        assert_eq!(probe.observed, 0);
+
+        let exists_before: bool = redis::cmd("EXISTS").arg(&key).query(&mut conn).unwrap();
+        assert!(!exists_before, "Probe check must not create key in Redis");
+
+        // 2. Consume 6 hits
+        let d = steward
+            .check_limit(&key, &limit, HitOperation::Consume(6))
+            .await
+            .unwrap();
+        assert!(d.allowed);
+        assert_eq!(d.observed, 6);
+
+        // Direct Redis assertions:
+        let exists: bool = redis::cmd("EXISTS").arg(&key).query(&mut conn).unwrap();
+        assert!(exists);
+
+        let key_type: String = redis::cmd("TYPE").arg(&key).query(&mut conn).unwrap();
+        assert_eq!(key_type, "zset");
+
+        let card: i64 = redis::cmd("ZCARD").arg(&key).query(&mut conn).unwrap();
+        assert_eq!(card, 6);
+
+        let pttl: i64 = redis::cmd("PTTL").arg(&key).query(&mut conn).unwrap();
+        assert!(pttl > 0 && pttl <= 20_000);
+
+        // 3. Attempt refund: refunds are non-refundable / unsupported for sliding window
+        let refund_res = steward
+            .check_limit(&key, &limit, HitOperation::Refund(2))
+            .await;
+        assert!(
+            refund_res.is_err(),
+            "refunds must be rejected for sliding window"
+        );
+        let err_msg = refund_res.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("refunds are unsupported for sliding window"),
+            "error message was: {err_msg}"
+        );
+
+        // ZCARD in Redis must remain strictly 6
+        let card_after: i64 = redis::cmd("ZCARD").arg(&key).query(&mut conn).unwrap();
+        assert_eq!(card_after, 6);
     }
 }
