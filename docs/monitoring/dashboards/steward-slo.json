@@ -1,0 +1,470 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": "-- Grafana --",
+        "enable": true,
+        "hide": true,
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "Production SLO, Decision Health, Latency, Admission Control, and Configuration Freshness Dashboard for Steward Rate-Limit Service",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "id": 100,
+      "title": "Service Level Objectives (SLOs)",
+      "type": "row"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 1 },
+      "id": 1,
+      "title": "Enforcement Availability SLO (Target: 99.99%)",
+      "type": "gauge",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "max": 100,
+          "min": 99.0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 99.90 },
+              { "color": "yellow", "value": 99.95 },
+              { "color": "green", "value": 99.99 }
+            ]
+          },
+          "unit": "percent"
+        }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "100 * (1 - (sum(rate(rate_limit_error_total{cluster=~\"$cluster\"}[$__rate_interval])) + sum(rate(requests_rejected_admission_total{cluster=~\"$cluster\"}[$__rate_interval])) + sum(rate(requests_deadline_exceeded_total{cluster=~\"$cluster\"}[$__rate_interval]))) / (sum(rate(rate_limit_allowed_total{cluster=~\"$cluster\"}[$__rate_interval])) + sum(rate(rate_limit_denied_total{cluster=~\"$cluster\"}[$__rate_interval])) + sum(rate(rate_limit_error_total{cluster=~\"$cluster\"}[$__rate_interval])) + sum(rate(requests_rejected_admission_total{cluster=~\"$cluster\"}[$__rate_interval])) + 0.001))",
+          "legendFormat": "30-Day Rolling Availability"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 1 },
+      "id": 2,
+      "title": "1-Hour Error Budget Burn Rate",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 1.0 },
+              { "color": "orange", "value": 6.0 },
+              { "color": "red", "value": 14.4 }
+            ]
+          },
+          "unit": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "(sum(rate(rate_limit_error_total{cluster=~\"$cluster\"}[1h])) + sum(rate(requests_rejected_admission_total{cluster=~\"$cluster\"}[1h])) + sum(rate(requests_deadline_exceeded_total{cluster=~\"$cluster\"}[1h]))) / (sum(rate(rate_limit_allowed_total{cluster=~\"$cluster\"}[1h])) + sum(rate(rate_limit_denied_total{cluster=~\"$cluster\"}[1h])) + 0.001) / 0.0001",
+          "legendFormat": "Burn Rate (1h)"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 6, "w": 6, "x": 12, "y": 1 },
+      "id": 3,
+      "title": "Active Config Snapshot Age",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 300 },
+              { "color": "orange", "value": 1800 },
+              { "color": "red", "value": 3600 }
+            ]
+          },
+          "unit": "s"
+        }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "max(config_age_seconds{cluster=~\"$cluster\"})",
+          "legendFormat": "Max Policy Age"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 6, "w": 6, "x": 18, "y": 1 },
+      "id": 4,
+      "title": "Stale Snapshot Alert Status",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [
+            { "options": { "0": { "color": "green", "text": "FRESH" }, "1": { "color": "red", "text": "STALE CRITICAL" } }, "type": "value" }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "max(config_stale{cluster=~\"$cluster\"})",
+          "legendFormat": "Stale Status"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 7 },
+      "id": 200,
+      "title": "Traffic Decisions & Admission Load Shedding",
+      "type": "row"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "id": 5,
+      "title": "Decision Throughput by Outcome (QPS)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisCenteredZero": false,
+            "drawStyle": "line",
+            "fillOpacity": 20,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "stacking": { "group": "A", "mode": "normal" }
+          },
+          "unit": "reqps"
+        }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "sum(rate(rate_limit_allowed_total{cluster=~\"$cluster\"}[$__rate_interval]))",
+          "legendFormat": "Allowed (OK)"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "sum(rate(rate_limit_denied_total{cluster=~\"$cluster\"}[$__rate_interval]))",
+          "legendFormat": "Denied (OverLimit)"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "sum(rate(rate_limit_error_total{cluster=~\"$cluster\"}[$__rate_interval]))",
+          "legendFormat": "Errors (Unavailable)"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "sum(rate(requests_rejected_admission_total{cluster=~\"$cluster\"}[$__rate_interval]))",
+          "legendFormat": "Shed (ResourceExhausted)"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "id": 6,
+      "title": "Admission Control & In-Flight Concurrency",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2 },
+          "unit": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "sum(requests_in_flight{cluster=~\"$cluster\"})",
+          "legendFormat": "Total In-Flight Requests"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "max(requests_in_flight{cluster=~\"$cluster\"})",
+          "legendFormat": "Max In-Flight per Replica"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "sum(rate(requests_rejected_admission_total{cluster=~\"$cluster\"}[$__rate_interval]))",
+          "legendFormat": "Admission Rejections / sec"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "sum(rate(requests_deadline_exceeded_total{cluster=~\"$cluster\"}[$__rate_interval]))",
+          "legendFormat": "Deadline Exceeded / sec"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 16 },
+      "id": 300,
+      "title": "Latency Percentiles (SLO Target: p99 <= 5ms, p99.9 <= 10ms)",
+      "type": "row"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 17 },
+      "id": 7,
+      "title": "Request Decision Latency (Allowed vs Denied)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "drawStyle": "line", "lineWidth": 2 },
+          "unit": "ms"
+        }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "histogram_quantile(0.50, sum(rate(request_duration_ms_bucket{cluster=~\"$cluster\"}[$__rate_interval])) by (le))",
+          "legendFormat": "p50 All"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "histogram_quantile(0.99, sum(rate(request_duration_ms_bucket{cluster=~\"$cluster\", outcome=\"allowed\"}[$__rate_interval])) by (le))",
+          "legendFormat": "p99 Allowed (SLO <= 5ms)"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "histogram_quantile(0.99, sum(rate(request_duration_ms_bucket{cluster=~\"$cluster\", outcome=\"denied\"}[$__rate_interval])) by (le))",
+          "legendFormat": "p99 Denied (SLO <= 5ms)"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "histogram_quantile(0.999, sum(rate(request_duration_ms_bucket{cluster=~\"$cluster\"}[$__rate_interval])) by (le))",
+          "legendFormat": "p99.9 All (SLO <= 10ms)"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 17 },
+      "id": 8,
+      "title": "Redis Backend Phase Latency",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "drawStyle": "line", "lineWidth": 2 },
+          "unit": "ms"
+        }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "histogram_quantile(0.50, sum(rate(redis_operation_time_ms_bucket{cluster=~\"$cluster\"}[$__rate_interval])) by (le))",
+          "legendFormat": "Redis p50"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "histogram_quantile(0.95, sum(rate(redis_operation_time_ms_bucket{cluster=~\"$cluster\"}[$__rate_interval])) by (le))",
+          "legendFormat": "Redis p95"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "histogram_quantile(0.99, sum(rate(redis_operation_time_ms_bucket{cluster=~\"$cluster\"}[$__rate_interval])) by (le))",
+          "legendFormat": "Redis p99 (Target <= 2ms)"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 25 },
+      "id": 400,
+      "title": "Redis Storage Backend & Script Health",
+      "type": "row"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 26 },
+      "id": 9,
+      "title": "Redis Storage Backend Errors & Timeouts",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "drawStyle": "line", "lineWidth": 2 },
+          "unit": "errorsps"
+        }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "sum(rate(redis_errors_total{cluster=~\"$cluster\"}[$__rate_interval]))",
+          "legendFormat": "Redis Errors / sec"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "sum(rate(redis_timeouts_total{cluster=~\"$cluster\"}[$__rate_interval]))",
+          "legendFormat": "Redis Timeouts / sec"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "sum(rate(redis_scripts_reloaded_total{cluster=~\"$cluster\"}[$__rate_interval]))",
+          "legendFormat": "NOSCRIPT Cache Reloads / sec"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 26 },
+      "id": 10,
+      "title": "Redis Primary Memory & Replication Health",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "drawStyle": "line", "lineWidth": 2 },
+          "unit": "percent"
+        }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "100 * (redis_memory_used_bytes{cluster=~\"$cluster\"} / redis_memory_max_bytes{cluster=~\"$cluster\"})",
+          "legendFormat": "Memory Used % (Warning: 75%, Crit: 85%)"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "redis_connected_slaves{cluster=~\"$cluster\"}",
+          "legendFormat": "Connected Standby Replicas"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 34 },
+      "id": 500,
+      "title": "Configuration Lifecycle & Version Convergence",
+      "type": "row"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 35 },
+      "id": 11,
+      "title": "Fleet Configuration Version Convergence",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "drawStyle": "line", "lineWidth": 2 },
+          "unit": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "config_version{cluster=~\"$cluster\"}",
+          "legendFormat": "{{instance}} Version Prefix"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 35 },
+      "id": 12,
+      "title": "Configuration Loader Health & Reload Errors",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "drawStyle": "line", "lineWidth": 2 },
+          "unit": "short"
+        }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "sum(config_consecutive_fetch_failures{cluster=~\"$cluster\"})",
+          "legendFormat": "Consecutive Fetch Failures"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "sum(rate(config_reloads_total{cluster=~\"$cluster\"}[$__rate_interval]))",
+          "legendFormat": "Successful Reloads / sec"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "sum(rate(config_not_modified_total{cluster=~\"$cluster\"}[$__rate_interval]))",
+          "legendFormat": "304 Not Modified Checks / sec"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "sum(rate(config_reload_errors_total{cluster=~\"$cluster\"}[$__rate_interval]))",
+          "legendFormat": "Reload Errors / sec"
+        }
+      ]
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["steward", "rate-limit", "slo", "production"],
+  "templating": {
+    "list": [
+      {
+        "current": { "selected": false, "value": "production" },
+        "name": "cluster",
+        "query": "label_values(rate_limit_allowed_total, cluster)",
+        "type": "query"
+      }
+    ]
+  },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": { "refresh_intervals": ["5s", "10s", "30s", "1m"] },
+  "timezone": "utc",
+  "title": "Steward / Service Level Objectives & Operations",
+  "uid": "steward-slo"
+}
