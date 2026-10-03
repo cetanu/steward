@@ -1,4 +1,5 @@
 /target
+/proto
 /test-reports
 /release
 *.tar.gz

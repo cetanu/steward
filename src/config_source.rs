@@ -247,7 +247,7 @@ pub fn compile_rate_limits_at(
 
     canonical_rules.sort();
     let canonical_joined = canonical_rules.join("\n");
-    let digest = ring::digest::digest(&ring::digest::SHA256, canonical_joined.as_bytes());
+    let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, canonical_joined.as_bytes());
     let version_hash: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
 
     let mut domains: HashMap<String, PolicyTrie> = HashMap::new();

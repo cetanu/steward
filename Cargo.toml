@@ -42,7 +42,9 @@ tracing-subscriber = { version = "0.3.23", features = ["json", "env-filter"] }
 
 # Metrics
 cadence = "1.8.0"
-ring = "0.17"
+
+# Cryptography
+aws-lc-rs = "1.18"
 
 [dev-dependencies]
 reqwest = { version = "0.13.5", features = ["json"] }
@@ -50,6 +52,11 @@ tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "time"] }
 
 [build-dependencies]
 tonic-prost-build = "0.14.6"
+regex = "1.12"
+zip = "9.0.0-pre3"
+fs_extra = "1.3"
+reqwest = { version = "0.13.5", features = ["blocking"] }
+serde = { version = "1.0", features = ["derive"] }
 
 [profile.release]
 opt-level = "z"
