@@ -56,8 +56,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         metrics.clone(),
     );
 
+    let redis_target = settings.redis_target();
+    info!(
+        redis_target = %steward::service::sanitize_url(&redis_target),
+        "connecting to Redis storage backend"
+    );
+
     let steward = Steward::try_new(
-        settings.redis_host.as_str(),
+        redis_target.as_str(),
         settings.default_ttl,
         config_rx,
         metrics,
@@ -79,12 +85,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let incoming = TcpListenerStream::new(listener);
 
     info!(%addr, "starting Steward rate-limit service");
-    Server::builder()
+    let mut server = Server::builder()
         .concurrency_limit_per_connection(1024)
         .tcp_keepalive(Some(std::time::Duration::from_secs(30)))
         .tcp_nodelay(true)
         .http2_keepalive_interval(Some(std::time::Duration::from_secs(60)))
-        .http2_keepalive_timeout(Some(std::time::Duration::from_secs(60)))
+        .http2_keepalive_timeout(Some(std::time::Duration::from_secs(60)));
+
+    if let Some(ref tls_settings) = settings.tls {
+        if let Some(identity) = tls_settings.load_identity()? {
+            let mut tls_config = tonic::transport::ServerTlsConfig::new().identity(identity);
+            if let Some(client_ca) = tls_settings.load_client_ca()? {
+                info!("enabling mutual TLS (mTLS) caller authentication");
+                tls_config = tls_config.client_ca_root(client_ca);
+            }
+            server = server.tls_config(tls_config)?;
+            info!("TLS transport enabled on gRPC server");
+        }
+    }
+
+    server
         .add_service(RateLimitServiceServer::new(steward))
         .serve_with_incoming(incoming)
         .await?;

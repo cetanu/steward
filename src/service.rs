@@ -300,15 +300,48 @@ impl Drop for InFlightGuard {
     }
 }
 
+/// Sanitize connection URLs for safe diagnostic logging, redacting passwords/credentials.
+pub fn sanitize_url(raw: &str) -> String {
+    if let Ok(mut parsed) = url::Url::parse(raw) {
+        if parsed.password().is_some() {
+            let _ = parsed.set_password(Some("*****"));
+        }
+        parsed.to_string()
+    } else {
+        raw.to_string()
+    }
+}
+
+/// Normalize Redis connection target to a valid redis://, rediss://, or unix:// URL.
+pub fn normalize_redis_url(target: &str) -> Result<String, String> {
+    let trimmed = target.trim();
+    if trimmed.is_empty() {
+        return Err("Redis connection target cannot be empty".to_string());
+    }
+    let url_str = if trimmed.starts_with("redis://")
+        || trimmed.starts_with("rediss://")
+        || trimmed.starts_with("unix://")
+    {
+        trimmed.to_string()
+    } else {
+        format!("redis://{trimmed}")
+    };
+
+    url::Url::parse(&url_str)
+        .map_err(|e| format!("invalid Redis URL '{}': {e}", sanitize_url(&url_str)))?;
+
+    Ok(url_str)
+}
+
 impl Steward {
     /// Construct a service with metrics disabled.
     pub async fn new(
-        redis_host: &str,
+        redis_target: &str,
         default_ttl: usize,
         config_rx: Receiver<RateLimitConfigs>,
     ) -> Self {
         Self::try_new(
-            redis_host,
+            redis_target,
             default_ttl,
             config_rx,
             std::sync::Arc::new(StatsdClient::from_sink("", NopMetricSink)),
@@ -319,16 +352,24 @@ impl Steward {
 
     /// Construct a service and return configuration or connection manager initialization errors.
     pub async fn try_new(
-        redis_host: &str,
+        redis_target: &str,
         default_ttl: usize,
         config_rx: Receiver<RateLimitConfigs>,
         metrics: SharedMetrics,
     ) -> Result<Self, String> {
-        let client = redis::Client::open(format!("redis://{redis_host}"))
-            .map_err(|error| format!("invalid Redis configuration: {error}"))?;
-        let redis = ConnectionManager::new(client)
-            .await
-            .map_err(|error| format!("failed to create Redis connection manager: {error}"))?;
+        let redis_url = normalize_redis_url(redis_target)?;
+        let client = redis::Client::open(redis_url.as_str()).map_err(|error| {
+            format!(
+                "invalid Redis configuration ({}): {error}",
+                sanitize_url(&redis_url)
+            )
+        })?;
+        let redis = ConnectionManager::new(client).await.map_err(|error| {
+            format!(
+                "failed to create Redis connection manager ({}): {error}",
+                sanitize_url(&redis_url)
+            )
+        })?;
 
         Ok(Self {
             config_rx,
@@ -5986,5 +6027,47 @@ mod tests {
             combined.contains("steward.in_flight_requests:0|g"),
             "must restore 0 in-flight after request completion"
         );
+    }
+
+    #[test]
+    fn test_redis_url_normalization_and_sanitization() {
+        use super::{normalize_redis_url, sanitize_url};
+
+        // 1. Bare host gets redis:// prefix
+        assert_eq!(
+            normalize_redis_url("127.0.0.1:6379").unwrap(),
+            "redis://127.0.0.1:6379"
+        );
+
+        // 2. redis:// preserved
+        assert_eq!(
+            normalize_redis_url("redis://my-host:6379/1").unwrap(),
+            "redis://my-host:6379/1"
+        );
+
+        // 3. rediss:// with TLS preserved
+        assert_eq!(
+            normalize_redis_url("rediss://user:secret@redis-cluster.example.com:6380/0").unwrap(),
+            "rediss://user:secret@redis-cluster.example.com:6380/0"
+        );
+
+        // 4. sanitize_url redacts passwords
+        let sanitized =
+            sanitize_url("rediss://appuser:supersecretpassword@secure-redis.cloud:6380/2");
+        assert!(!sanitized.contains("supersecretpassword"));
+        assert!(sanitized.contains("*****"));
+        assert_eq!(
+            sanitized,
+            "rediss://appuser:*****@secure-redis.cloud:6380/2"
+        );
+
+        // 5. sanitize_url handles URLs without passwords cleanly
+        assert_eq!(
+            sanitize_url("redis://localhost:6379/0"),
+            "redis://localhost:6379/0"
+        );
+
+        // 6. Empty target errors
+        assert!(normalize_redis_url("   ").is_err());
     }
 }

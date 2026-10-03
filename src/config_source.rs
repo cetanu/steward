@@ -366,6 +366,9 @@ pub struct ListenConfig {
 pub struct Settings {
     pub listen: ListenConfig,
     pub rate_limit_configs: ConfigSource,
+    #[serde(default)]
+    pub redis_url: Option<String>,
+    #[serde(default = "default_redis_host")]
     pub redis_host: String,
     #[serde(default = "default_redis_connections")]
     pub redis_connections: Option<usize>,
@@ -379,6 +382,73 @@ pub struct Settings {
     pub execution_timeout_ms: u64,
     #[serde(default = "default_max_concurrent_requests")]
     pub max_concurrent_requests: usize,
+    #[serde(default)]
+    pub tls: Option<TlsSettings>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TlsSettings {
+    #[serde(default)]
+    pub cert_path: Option<String>,
+    #[serde(default)]
+    pub key_path: Option<String>,
+    #[serde(default)]
+    pub client_ca_path: Option<String>,
+    #[serde(default)]
+    pub require_client_auth: bool,
+}
+
+impl TlsSettings {
+    pub fn is_enabled(&self) -> bool {
+        self.cert_path.is_some() && self.key_path.is_some()
+            || (env::var("STEWARD_TLS_CERT").is_ok() && env::var("STEWARD_TLS_KEY").is_ok())
+            || (env::var("STEWARD_TLS_CERT_PATH").is_ok()
+                && env::var("STEWARD_TLS_KEY_PATH").is_ok())
+    }
+
+    pub fn load_identity(&self) -> Result<Option<tonic::transport::Identity>, String> {
+        let cert_pem = if let Ok(cert) = env::var("STEWARD_TLS_CERT") {
+            cert.into_bytes()
+        } else if let Ok(path) = env::var("STEWARD_TLS_CERT_PATH") {
+            std::fs::read(&path)
+                .map_err(|e| format!("failed to read STEWARD_TLS_CERT_PATH '{path}': {e}"))?
+        } else if let Some(ref path) = self.cert_path {
+            std::fs::read(path).map_err(|e| format!("failed to read cert_path '{path}': {e}"))?
+        } else {
+            return Ok(None);
+        };
+
+        let key_pem = if let Ok(key) = env::var("STEWARD_TLS_KEY") {
+            key.into_bytes()
+        } else if let Ok(path) = env::var("STEWARD_TLS_KEY_PATH") {
+            std::fs::read(&path)
+                .map_err(|e| format!("failed to read STEWARD_TLS_KEY_PATH '{path}': {e}"))?
+        } else if let Some(ref path) = self.key_path {
+            std::fs::read(path).map_err(|e| format!("failed to read key_path '{path}': {e}"))?
+        } else {
+            return Ok(None);
+        };
+
+        Ok(Some(tonic::transport::Identity::from_pem(
+            cert_pem, key_pem,
+        )))
+    }
+
+    pub fn load_client_ca(&self) -> Result<Option<tonic::transport::Certificate>, String> {
+        let ca_pem = if let Ok(ca) = env::var("STEWARD_TLS_CLIENT_CA") {
+            ca.into_bytes()
+        } else if let Ok(path) = env::var("STEWARD_TLS_CLIENT_CA_PATH") {
+            std::fs::read(&path)
+                .map_err(|e| format!("failed to read STEWARD_TLS_CLIENT_CA_PATH '{path}': {e}"))?
+        } else if let Some(ref path) = self.client_ca_path {
+            std::fs::read(path)
+                .map_err(|e| format!("failed to read client_ca_path '{path}': {e}"))?
+        } else {
+            return Ok(None);
+        };
+
+        Ok(Some(tonic::transport::Certificate::from_pem(ca_pem)))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -393,6 +463,10 @@ pub struct StatsdConfig {
     pub prefix: String,
     #[serde(default = "default_statsd_queue_capacity")]
     pub queue_capacity: usize,
+}
+
+fn default_redis_host() -> String {
+    "127.0.0.1:6379".to_string()
 }
 
 fn default_execution_timeout_ms() -> u64 {
@@ -433,6 +507,20 @@ impl Settings {
         }
         builder = builder.add_source(Environment::with_prefix("STEWARD").separator("__"));
         builder.build()?.try_deserialize()
+    }
+
+    pub fn redis_target(&self) -> String {
+        if let Ok(env_url) = env::var("REDIS_URL") {
+            if !env_url.trim().is_empty() {
+                return env_url.trim().to_string();
+            }
+        }
+        if let Some(ref url) = self.redis_url {
+            if !url.trim().is_empty() {
+                return url.trim().to_string();
+            }
+        }
+        self.redis_host.clone()
     }
 }
 
@@ -939,5 +1027,82 @@ mod tests {
             "zero requests_per_unit must fail startup validation"
         );
         let _ = std::fs::remove_file(&file_path_val);
+    }
+
+    #[test]
+    fn settings_redis_target_precedence() {
+        use super::{ConfigSource, ListenConfig, Settings};
+
+        let mut settings = Settings {
+            listen: ListenConfig {
+                addr: "0.0.0.0".parse().unwrap(),
+                port: 5001,
+            },
+            rate_limit_configs: ConfigSource::File("test.json".to_string()),
+            redis_url: None,
+            redis_host: "legacy-host:6379".to_string(),
+            redis_connections: Some(1),
+            default_ttl: 10,
+            config_refresh_interval_secs: 60,
+            metrics: None,
+            execution_timeout_ms: 10,
+            max_concurrent_requests: 1024,
+            tls: None,
+        };
+
+        // 1. Default to redis_host when no REDIS_URL or redis_url
+        unsafe { std::env::remove_var("REDIS_URL") };
+        assert_eq!(settings.redis_target(), "legacy-host:6379");
+
+        // 2. redis_url takes precedence over redis_host
+        settings.redis_url = Some("rediss://default:secret@redis-cluster:6380".to_string());
+        assert_eq!(
+            settings.redis_target(),
+            "rediss://default:secret@redis-cluster:6380"
+        );
+
+        // 3. REDIS_URL environment variable takes highest precedence
+        unsafe {
+            std::env::set_var(
+                "REDIS_URL",
+                "rediss://env-user:env-pass@env-redis.cloud:6379",
+            );
+        }
+        assert_eq!(
+            settings.redis_target(),
+            "rediss://env-user:env-pass@env-redis.cloud:6379"
+        );
+        unsafe { std::env::remove_var("REDIS_URL") };
+    }
+
+    #[test]
+    fn tls_settings_lifecycle_and_env_overrides() {
+        use super::TlsSettings;
+
+        let tls = TlsSettings::default();
+        assert!(!tls.is_enabled());
+
+        // Test environment variable loading
+        let cert_content = "-----BEGIN CERTIFICATE-----\nMIIB...\n-----END CERTIFICATE-----";
+        let key_content = "-----BEGIN PRIVATE KEY-----\nMIIE...\n-----END PRIVATE KEY-----";
+        let ca_content = "-----BEGIN CERTIFICATE-----\nMIIC...\n-----END CERTIFICATE-----";
+
+        unsafe {
+            std::env::set_var("STEWARD_TLS_CERT", cert_content);
+            std::env::set_var("STEWARD_TLS_KEY", key_content);
+            std::env::set_var("STEWARD_TLS_CLIENT_CA", ca_content);
+        }
+
+        assert!(tls.is_enabled());
+        let identity = tls.load_identity().unwrap().expect("identity should load");
+        let _ = identity;
+        let ca = tls.load_client_ca().unwrap().expect("ca should load");
+        let _ = ca;
+
+        unsafe {
+            std::env::remove_var("STEWARD_TLS_CERT");
+            std::env::remove_var("STEWARD_TLS_KEY");
+            std::env::remove_var("STEWARD_TLS_CLIENT_CA");
+        }
     }
 }
