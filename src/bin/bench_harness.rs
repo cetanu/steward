@@ -516,7 +516,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Matrix 1: Throughput and Saturation Curve (Fixed Window, 1 Rule, Cost 1, Uniform)
     println!("\n--- Matrix 1: Offered Throughput vs Saturation (Fixed Window, 1 Rule) ---");
-    let target_rates = [5_000, 10_000, 15_000, 20_000, 25_000];
+    let target_rates = [5_000, 10_000, 15_000, 20_000, 25_000, 30_000];
     for qps in target_rates {
         println!("   Running offered load: {qps} QPS...");
         let sc = ScenarioConfig {
@@ -670,6 +670,104 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             res.p95_micros,
             res.p99_micros,
             res.p99_9_micros
+        );
+        results.push(res);
+    }
+
+    // Matrix 7: High-Cardinality Churn (100,000 unique client keys at 20k QPS)
+    println!("\n--- Matrix 7: High-Cardinality Churn (100,000 unique keys at 20k QPS) ---");
+    {
+        let sc = ScenarioConfig {
+            name: "High-Cardinality-100k".to_string(),
+            domain: "bench_fixed_window_1".to_string(),
+            algorithm: "fixed_window".to_string(),
+            rule_count: 1,
+            hit_cost: 1,
+            distribution: KeyDistribution::Uniform,
+            target_qps: 20_000,
+            duration_secs: 5,
+            key_cardinality: 100_000,
+        };
+        let mut res = run_grpc_benchmark(channel.clone(), sc).await?;
+        res.redis_rss_mb = read_rss_mb(redis_pid);
+        println!(
+            "     -> Completed: {:.0} QPS | p50: {}us | p95: {}us | p99: {}us | p99.9: {}us | Service RSS: {:.1} MiB | Redis RSS: {:.1} MiB",
+            res.completed_qps,
+            res.p50_micros,
+            res.p95_micros,
+            res.p99_micros,
+            res.p99_9_micros,
+            res.service_rss_mb,
+            res.redis_rss_mb
+        );
+        results.push(res);
+    }
+
+    // Matrix 8: 3x Traffic Burst (60,000 QPS Spike)
+    println!("\n--- Matrix 8: 3x Traffic Burst (60,000 QPS Spike) ---");
+    {
+        let sc = ScenarioConfig {
+            name: "Burst-3x-60000-QPS".to_string(),
+            domain: "bench_fixed_window_1".to_string(),
+            algorithm: "fixed_window".to_string(),
+            rule_count: 1,
+            hit_cost: 1,
+            distribution: KeyDistribution::Uniform,
+            target_qps: 60_000,
+            duration_secs: 3,
+            key_cardinality: 10_000,
+        };
+        let mut res = run_grpc_benchmark(channel.clone(), sc).await?;
+        res.redis_rss_mb = read_rss_mb(redis_pid);
+        println!(
+            "     -> Completed: {:.0} QPS | p50: {}us | p95: {}us | p99: {}us | p99.9: {}us | Service RSS: {:.1} MiB | Redis RSS: {:.1} MiB",
+            res.completed_qps,
+            res.p50_micros,
+            res.p95_micros,
+            res.p99_micros,
+            res.p99_9_micros,
+            res.service_rss_mb,
+            res.redis_rss_mb
+        );
+        results.push(res);
+    }
+
+    // Matrix 9: Extended Steady-State Soak Run
+    let soak_secs = if let Some(pos) = std::env::args().position(|a| a == "--soak-secs") {
+        std::env::args()
+            .nth(pos + 1)
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(21600)
+    } else if std::env::args().any(|a| a == "--soak") {
+        21600
+    } else {
+        10
+    };
+
+    println!("\n--- Matrix 9: Steady-State Soak (20,000 QPS, {soak_secs}s) ---");
+    {
+        let sc = ScenarioConfig {
+            name: format!("Soak-20kQPS-{soak_secs}s"),
+            domain: "bench_fixed_window_1".to_string(),
+            algorithm: "fixed_window".to_string(),
+            rule_count: 1,
+            hit_cost: 1,
+            distribution: KeyDistribution::Uniform,
+            target_qps: 20_000,
+            duration_secs: soak_secs,
+            key_cardinality: 10_000,
+        };
+        let mut res = run_grpc_benchmark(channel.clone(), sc).await?;
+        res.redis_rss_mb = read_rss_mb(redis_pid);
+        println!(
+            "     -> Completed: {:.0} QPS | p50: {}us | p95: {}us | p99: {}us | p99.9: {}us | Service RSS: {:.1} MiB | Redis RSS: {:.1} MiB",
+            res.completed_qps,
+            res.p50_micros,
+            res.p95_micros,
+            res.p99_micros,
+            res.p99_9_micros,
+            res.service_rss_mb,
+            res.redis_rss_mb
         );
         results.push(res);
     }
