@@ -241,10 +241,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let b_res = b_client.should_rate_limit(req.clone()).await;
             let c_res = c_client.should_rate_limit(req.clone()).await;
 
-            if let (Ok(br), Ok(cr)) = (b_res, c_res) {
-                if br.into_inner().overall_code != cr.into_inner().overall_code {
-                    decision_divergences += 1;
-                }
+            if let (Ok(br), Ok(cr)) = (b_res, c_res)
+                && br.into_inner().overall_code != cr.into_inner().overall_code
+            {
+                decision_divergences += 1;
             }
         }
 

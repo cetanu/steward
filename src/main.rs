@@ -95,16 +95,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .http2_keepalive_interval(Some(std::time::Duration::from_secs(60)))
         .http2_keepalive_timeout(Some(std::time::Duration::from_secs(60)));
 
-    if let Some(ref tls_settings) = settings.tls {
-        if let Some(identity) = tls_settings.load_identity()? {
-            let mut tls_config = tonic::transport::ServerTlsConfig::new().identity(identity);
-            if let Some(client_ca) = tls_settings.load_client_ca()? {
-                info!("enabling mutual TLS (mTLS) caller authentication");
-                tls_config = tls_config.client_ca_root(client_ca);
-            }
-            server = server.tls_config(tls_config)?;
-            info!("TLS transport enabled on gRPC server");
+    if let Some(ref tls_settings) = settings.tls
+        && let Some(identity) = tls_settings.load_identity()?
+    {
+        let mut tls_config = tonic::transport::ServerTlsConfig::new().identity(identity);
+        if let Some(client_ca) = tls_settings.load_client_ca()? {
+            info!("enabling mutual TLS (mTLS) caller authentication");
+            tls_config = tls_config.client_ca_root(client_ca);
         }
+        server = server.tls_config(tls_config)?;
+        info!("TLS transport enabled on gRPC server");
     }
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();

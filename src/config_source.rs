@@ -433,12 +433,12 @@ pub async fn fetch_http_config(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    if let Some(content_length) = response.content_length() {
-        if content_length > MAX_CONFIG_PAYLOAD_BYTES as u64 {
-            return Err(format!(
-                "config response Content-Length ({content_length} bytes) exceeds maximum allowed limit ({MAX_CONFIG_PAYLOAD_BYTES} bytes)"
-            ));
-        }
+    if let Some(content_length) = response.content_length()
+        && content_length > MAX_CONFIG_PAYLOAD_BYTES as u64
+    {
+        return Err(format!(
+            "config response Content-Length ({content_length} bytes) exceeds maximum allowed limit ({MAX_CONFIG_PAYLOAD_BYTES} bytes)"
+        ));
     }
 
     let mut body_bytes = Vec::new();
@@ -926,15 +926,15 @@ impl Settings {
     }
 
     pub fn redis_target(&self) -> String {
-        if let Ok(env_url) = env::var("REDIS_URL") {
-            if !env_url.trim().is_empty() {
-                return env_url.trim().to_string();
-            }
+        if let Ok(env_url) = env::var("REDIS_URL")
+            && !env_url.trim().is_empty()
+        {
+            return env_url.trim().to_string();
         }
-        if let Some(ref url) = self.redis_url {
-            if !url.trim().is_empty() {
-                return url.trim().to_string();
-            }
+        if let Some(ref url) = self.redis_url
+            && !url.trim().is_empty()
+        {
+            return url.trim().to_string();
         }
         self.redis_host.clone()
     }

@@ -319,10 +319,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let resp_during_outage = client.should_rate_limit(req.clone()).await;
         let mut unavailable_count = 0;
-        if let Err(status) = resp_during_outage {
-            if status.code() == tonic::Code::Unavailable {
-                unavailable_count += 1;
-            }
+        if let Err(status) = resp_during_outage
+            && status.code() == tonic::Code::Unavailable
+        {
+            unavailable_count += 1;
         }
         println!("   [Phase 2 Outcome] Call during outage returned: Unavailable (F06 compliant)");
 
