@@ -2,7 +2,7 @@
 name = "steward"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.99"
 
 authors = ["Vasilios Syrakis <syrakis@pm.me>"]
 description = "High-performance Envoy rate-limit service in Rust"

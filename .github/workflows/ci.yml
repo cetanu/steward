@@ -71,7 +71,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.88.0"
+          toolchain: "1.99.0"
           components: rustfmt, clippy
       - name: Install protobuf compiler
         run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes protobuf-compiler
@@ -95,7 +95,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.88.0"
+          toolchain: "1.99.0"
       - name: Install protobuf compiler
         run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes protobuf-compiler
       - uses: Swatinem/rust-cache@v2
@@ -129,7 +129,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.88.0"
+          toolchain: "1.99.0"
       - name: Install protobuf compiler
         run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes protobuf-compiler
       - uses: Swatinem/rust-cache@v2
@@ -163,7 +163,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.88.0"
+          toolchain: "1.99.0"
       - name: Install Redis and protobuf compiler
         run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes redis-server protobuf-compiler
       - uses: Swatinem/rust-cache@v2
@@ -224,7 +224,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.88.0"
+          toolchain: "1.99.0"
       - id: release-plz
         uses: release-plz/action@v0.5
         with:
@@ -257,7 +257,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.88.0"
+          toolchain: "1.99.0"
       - uses: release-plz/action@v0.5
         with:
           command: release-pr

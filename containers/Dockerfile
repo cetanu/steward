@@ -1,4 +1,4 @@
-FROM rust:1.88-bookworm AS builder
+FROM rust:1.99-bookworm AS builder
 RUN apt-get update \
     && apt-get install --no-install-recommends --yes protobuf-compiler ca-certificates \
     && rm -rf /var/lib/apt/lists/*

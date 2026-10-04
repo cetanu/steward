@@ -10,7 +10,7 @@ The following files define standalone production container images:
 
 * **[`Dockerfile`](Dockerfile)**:
   Multi-stage production build definition:
-  - **Stage 1 (Builder):** Uses `rust:1.88-bookworm` to compile the release binary (`cargo build --release --locked --bin steward`).
+  - **Stage 1 (Builder):** Uses `rust:1.99-bookworm` to compile the release binary (`cargo build --release --locked --bin steward`).
   - **Stage 2 (Runtime):** Uses minimal `debian:bookworm-slim` with updated CA certificates.
   - **Security:** Runs as an unprivileged, non-root user (`steward: 10001:10001`).
   - **Independence:** Contains strictly the compiled `/project/steward` binary and OS certificates. It contains **no** baked-in policy files, mock hostnames, or test configurations.

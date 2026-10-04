@@ -39,7 +39,7 @@ Building and testing
 
 ### Optional prerequisites for building locally
 
-* Rust toolchain 1.88 or newer
+* Rust toolchain 1.99 or newer
 
 
 ### Building locally
