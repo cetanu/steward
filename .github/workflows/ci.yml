@@ -217,7 +217,6 @@ jobs:
     permissions:
       contents: write
       pull-requests: read
-      id-token: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -287,8 +286,8 @@ jobs:
 
   publish-release:
     name: Publish GitHub release
-    needs: [release, upload-binary]
-    if: always() && needs.upload-binary.result == 'success' && needs.release.outputs.tag != ''
+    needs: [release, upload-binary, publish-container]
+    if: always() && needs.upload-binary.result == 'success' && needs.publish-container.result == 'success' && needs.release.outputs.tag != ''
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -299,3 +298,34 @@ jobs:
           RELEASE_TAG: ${{ needs.release.outputs.tag }}
           REPOSITORY: ${{ github.repository }}
         run: gh release edit "$RELEASE_TAG" --repo "$REPOSITORY" --draft=false
+
+  publish-container:
+    name: Publish GitHub container image
+    needs: [release, test, integration, container-scan, qualification]
+    if: always() && needs.test.result == 'success' && needs.integration.result == 'success' && needs.container-scan.result == 'success' && needs.qualification.result == 'success' && needs.release.outputs.tag != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release.outputs.tag }}
+          persist-credentials: false
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish release image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: containers/Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ needs.release.outputs.tag }}
+            ghcr.io/${{ github.repository }}:latest

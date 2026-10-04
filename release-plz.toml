@@ -5,5 +5,5 @@ git_tag_enable = true
 # A release is only public after its binary and checksum are attached.
 git_release_draft = true
 
-# Publish the crate to crates.io when the release PR is merged.
-publish = true
+# Steward is distributed as a container image and GitHub release assets.
+publish = false
