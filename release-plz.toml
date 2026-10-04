@@ -7,3 +7,6 @@ git_release_draft = true
 
 # Steward is distributed as a container image and GitHub release assets.
 publish = false
+
+# Track releases by Git tags; the crate name is owned by another project.
+git_only = true
