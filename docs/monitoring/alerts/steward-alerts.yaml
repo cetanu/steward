@@ -222,7 +222,7 @@ groups:
           tier: storage
         annotations:
           summary: "Steward Redis backend error rate > 0.1%"
-          description: "Steward is experiencing elevated Redis storage errors ({{ $value | printf \"%.3f\" }}%). F06 error precedence is returning Unavailable to Envoy."
+          description: "Steward is experiencing elevated Redis storage errors ({{ $value | printf \"%.3f\" }}%). Storage errors are being returned to Envoy."
           runbook_url: "docs/runbooks/redis-failover-and-oom.md"
 
       - alert: StewardRedisMemorySaturationWarning

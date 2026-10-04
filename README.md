@@ -19,11 +19,12 @@ Features
 Documentation
 ------------------------------------------------------------
 
-* [Rate Limiting Algorithms](docs/algorithms.md): How fixed-window, token-bucket, and sliding-window algorithms work.
-* [Redis Operations Guide](docs/redis-operational-guide.md): Topology, sizing, memory configuration, and failover behavior.
+* [Rate Limiting Algorithms](docs/algorithms.md): Behavior and trade-offs for each algorithm.
+* [Redis Operations Guide](docs/redis-operational-guide.md): Redis setup, capacity, and failure behavior.
 * [Operational Runbooks](docs/runbooks/README.md): Procedures for incidents, latency spikes, and emergency bypass.
-* [Benchmarks](docs/benchmarks.md): Performance and throughput measurements.
-* [Release Qualification](docs/release-qualification/release-dossier-v1.0.md): Test and load qualification summary.
+* [Monitoring](docs/monitoring/dashboards/README.md): Metrics, dashboards, and alerts.
+* [Verification](docs/verification.md): Checks for contributors and how to run the benchmark harness.
+* [Benchmarking](docs/benchmarks.md): Benchmark scope and how to interpret local results.
 
 
 

@@ -163,6 +163,37 @@ jobs:
         if: always()
         run: make clean
 
+  qualification:
+    name: Release qualification harnesses
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.release_tag) || github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88.0"
+      - name: Install Redis and protobuf compiler
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes redis-server protobuf-compiler
+      - uses: Swatinem/rust-cache@v2
+      - name: Run benchmark harness
+        run: set -o pipefail; cargo run --release --locked --bin bench_harness 2>&1 | tee qualification-benchmarks.log
+      - name: Run canary harness
+        run: set -o pipefail; cargo run --release --locked --bin canary_harness 2>&1 | tee qualification-canary.log
+      - name: Run chaos harness
+        run: set -o pipefail; cargo run --release --locked --bin chaos_harness 2>&1 | tee qualification-chaos.log
+      - name: Preserve qualification output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qualification-${{ github.sha }}
+          path: qualification-*.log
+          if-no-files-found: warn
+          retention-days: 30
+
   container-scan:
     name: Container security scan
     needs: [check, test]
@@ -191,7 +222,7 @@ jobs:
 
   release:
     name: Create draft release
-    needs: [commitlint, audit, sbom, check, test, integration, container-scan]
+    needs: [commitlint, audit, sbom, check, test, integration, container-scan, qualification]
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     outputs:
@@ -223,7 +254,7 @@ jobs:
 
   release-pr:
     name: Prepare release pull request
-    needs: [commitlint, audit, sbom, check, test, integration, container-scan]
+    needs: [commitlint, audit, sbom, check, test, integration, container-scan, qualification]
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
@@ -248,8 +279,8 @@ jobs:
 
   upload-binary:
     name: Upload tested Linux binaries and SBOM
-    needs: [release, test, integration, sbom]
-    if: always() && needs.test.result == 'success' && needs.integration.result == 'success' && (needs.release.outputs.tag != '' || github.event.inputs.release_tag != '')
+    needs: [release, test, integration, sbom, qualification]
+    if: always() && needs.test.result == 'success' && needs.integration.result == 'success' && needs.qualification.result == 'success' && (needs.release.outputs.tag != '' || github.event.inputs.release_tag != '')
     runs-on: ubuntu-latest
     permissions:
       contents: write

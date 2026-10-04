@@ -22,7 +22,7 @@ The `steward-slo` dashboard is organized into logical operational rows:
 - **Decision Throughput by Outcome (QPS):** Stacked real-time visualization of:
   - `Allowed (OK)`: Admitted traffic within quota.
   - `Denied (OverLimit)`: Requests rejected due to quota exhaustion.
-  - `Errors (Unavailable)`: Storage backend failure (propagated to Envoy per F06).
+  - `Errors (Unavailable)`: Storage backend failures returned to Envoy.
   - `Shed (ResourceExhausted)`: Load shedding rejections when in-flight concurrency reaches 1,024 permits.
 - **Admission Control & In-Flight Concurrency:** Monitored against the 1,024 permit global ceiling. Tracks `requests.in_flight`, `requests.rejected_admission`, and `requests.deadline_exceeded`.
 
