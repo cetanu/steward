@@ -1,5 +1,9 @@
 COMPOSE ?= docker compose
 
+.PHONY: install-hooks
+install-hooks:
+	git config core.hooksPath .githooks
+
 clean:
 	$(COMPOSE) down --rmi local -v --remove-orphans --timeout 1
 

@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+
+git diff --cached --check
+
+rust_changes=$(git diff --cached --name-only --diff-filter=ACMR | grep -E '(^|/)(Cargo\.toml|Cargo\.lock|build\.rs|rust-toolchain\.toml)$|\.rs$|^proto/vendor/' || true)
+if [ -n "$rust_changes" ]; then
+	 cargo fmt --all -- --check
+	 cargo clippy --locked --all-targets --all-features -- -D warnings
+fi
