@@ -242,7 +242,7 @@ jobs:
 
   release-pr:
     name: Prepare release pull request
-    needs: [commitlint, audit, sbom, check, test, integration, container-scan, qualification]
+    needs: [release, commitlint, audit, sbom, check, test, integration, container-scan, qualification]
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
