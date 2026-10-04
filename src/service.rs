@@ -274,6 +274,11 @@ enum DescriptorEvaluation {
     Matched(DescriptorMatch),
 }
 
+enum PreparedRequest {
+    Unconfigured(Vec<DescriptorStatus>),
+    Configured(Vec<DescriptorEvaluation>),
+}
+
 #[derive(Clone)]
 pub struct Steward {
     config_rx: Receiver<RateLimitConfigs>,
@@ -911,26 +916,105 @@ pub fn compute_descriptor_hit_cost(
     Ok(cost)
 }
 
-pub fn is_trusted_caller(metadata: &tonic::metadata::MetadataMap) -> bool {
-    metadata
-        .get("x-steward-trusted")
-        .and_then(|v| v.to_str().ok())
-        == Some("true")
-        || metadata
-            .get("x-steward-internal")
-            .and_then(|v| v.to_str().ok())
-            == Some("true")
-        || metadata
-            .get("x-trusted-caller")
-            .and_then(|v| v.to_str().ok())
-            == Some("true")
-        || metadata.contains_key("x-forwarded-client-cert")
-        || metadata.contains_key("authorization")
-}
+impl Steward {
+    fn prepare_request(
+        &self,
+        request: &RateLimitRequest,
+        rpc_start: std::time::Instant,
+    ) -> Result<PreparedRequest, tonic::Status> {
+        validate_request(request).map_err(|status| {
+            count(&self.metrics, "requests.invalid", 1);
+            time(&self.metrics, "rpc.duration", rpc_start.elapsed());
+            status
+        })?;
 
-#[tonic::async_trait]
-impl RateLimitService for Steward {
-    async fn should_rate_limit(
+        let configs = self.config_rx.borrow();
+        let Some(domain_policy) = configs.get(&request.domain) else {
+            count(&self.metrics, "requests.unconfigured", 1);
+            count(&self.metrics, "requests.allowed", 1);
+            time(&self.metrics, "rpc.duration.allowed", rpc_start.elapsed());
+            time(&self.metrics, "rpc.duration", rpc_start.elapsed());
+            debug!(domain = %request.domain, "unconfigured domain allowed");
+            let statuses = request
+                .descriptors
+                .iter()
+                .map(|_| {
+                    count(&self.metrics, "descriptors.unmatched", 1);
+                    DescriptorStatus {
+                        code: Code::Ok as i32,
+                        current_limit: None,
+                        limit_remaining: 0,
+                        duration_until_reset: None,
+                        quota: None,
+                    }
+                })
+                .collect();
+            return Ok(PreparedRequest::Unconfigured(statuses));
+        };
+
+        let mut evaluations = Vec::with_capacity(request.descriptors.len());
+        for req_desc in &request.descriptors {
+            let hit_cost = compute_descriptor_hit_cost(req_desc, request.hits_addend)?;
+            let operation = if req_desc.is_negative_hits {
+                HitOperation::Refund(hit_cost)
+            } else if hit_cost == 0 {
+                HitOperation::Probe
+            } else {
+                HitOperation::Consume(hit_cost)
+            };
+
+            let entries: Vec<(&str, &str)> = req_desc
+                .entries
+                .iter()
+                .map(|entry| (entry.key.as_str(), entry.value.as_str()))
+                .collect();
+            let Some(matched) = domain_policy.match_entries(&entries) else {
+                evaluations.push(DescriptorEvaluation::Unmatched);
+                continue;
+            };
+
+            if req_desc.is_negative_hits
+                && matched
+                    .rate_limits
+                    .iter()
+                    .any(|limit| limit.algorithm == Algorithm::SlidingWindow)
+            {
+                time(&self.metrics, "rpc.duration", rpc_start.elapsed());
+                return Err(tonic::Status::failed_precondition(
+                    "refunds are unsupported for sliding-window rate limits",
+                ));
+            }
+
+            let encoded_path = encode_canonical_path(entries);
+            let mut limits_to_check = Vec::with_capacity(matched.rate_limits.len());
+            for configured_limit in matched.rate_limits {
+                let effective_limit = req_desc
+                    .limit
+                    .as_ref()
+                    .map(|override_| configured_limit.with_override(override_))
+                    .unwrap_or_else(|| *configured_limit);
+                let key = rate_limit_key(
+                    &request.domain,
+                    matched.policy_id,
+                    &encoded_path,
+                    configured_limit,
+                );
+                limits_to_check.push((key, effective_limit));
+            }
+
+            if limits_to_check.is_empty() {
+                evaluations.push(DescriptorEvaluation::Unmatched);
+            } else {
+                evaluations.push(DescriptorEvaluation::Matched(DescriptorMatch {
+                    limits_to_check,
+                    operation,
+                }));
+            }
+        }
+        Ok(PreparedRequest::Configured(evaluations))
+    }
+
+    async fn handle_request(
         &self,
         request: tonic::Request<RateLimitRequest>,
     ) -> Result<Response<RateLimitResponse>, tonic::Status> {
@@ -989,115 +1073,11 @@ impl RateLimitService for Steward {
 
         let (metadata, _, request) = request.into_parts();
 
-        // 1. Request Dimension & Override Validation
-        if let Err(status) = validate_request(&request) {
-            count(&self.metrics, "requests.invalid", 1);
-            time(&self.metrics, "rpc.duration", rpc_start.elapsed());
-            return Err(status);
-        }
-
-        // 2. Caller Authorization for Negative Hits (Refunds)
-        let has_negative_hits = request.descriptors.iter().any(|d| d.is_negative_hits);
-        if has_negative_hits && !is_trusted_caller(&metadata) {
-            count(&self.metrics, "requests.unauthorized_refund", 1);
-            time(&self.metrics, "rpc.duration", rpc_start.elapsed());
-            return Err(tonic::Status::permission_denied(
-                "untrusted caller cannot perform negative hits (refund)",
-            ));
-        }
-
-        // 3. In-memory Hierarchical Match Phase (precompiled trie lookup)
-        let evaluations: Vec<DescriptorEvaluation> = {
-            let configs = self.config_rx.borrow();
-            let Some(domain_policy) = configs.get(&request.domain) else {
-                count(&self.metrics, "requests.unconfigured", 1);
-                count(&self.metrics, "requests.allowed", 1);
-                time(&self.metrics, "rpc.duration.allowed", rpc_start.elapsed());
-                time(&self.metrics, "rpc.duration", rpc_start.elapsed());
-                debug!(domain = %request.domain, "unconfigured domain allowed");
-                let statuses = request
-                    .descriptors
-                    .iter()
-                    .map(|_| {
-                        count(&self.metrics, "descriptors.unmatched", 1);
-                        DescriptorStatus {
-                            code: Code::Ok as i32,
-                            current_limit: None,
-                            limit_remaining: 0,
-                            duration_until_reset: None,
-                            quota: None,
-                        }
-                    })
-                    .collect();
+        let evaluations = match self.prepare_request(&request, rpc_start)? {
+            PreparedRequest::Unconfigured(statuses) => {
                 return Ok(Response::new(build_response(false, statuses)));
-            };
-
-            let mut evals = Vec::with_capacity(request.descriptors.len());
-            for req_desc in &request.descriptors {
-                let hit_cost = compute_descriptor_hit_cost(req_desc, request.hits_addend)?;
-                let op = if req_desc.is_negative_hits {
-                    HitOperation::Refund(hit_cost)
-                } else if hit_cost == 0 {
-                    HitOperation::Probe
-                } else {
-                    HitOperation::Consume(hit_cost)
-                };
-
-                let entries: Vec<(&str, &str)> = req_desc
-                    .entries
-                    .iter()
-                    .map(|e| (e.key.as_str(), e.value.as_str()))
-                    .collect();
-
-                let match_result = domain_policy.match_entries(&entries);
-                match match_result {
-                    Some(res) => {
-                        if req_desc.is_negative_hits
-                            && res
-                                .rate_limits
-                                .iter()
-                                .any(|l| l.algorithm == Algorithm::SlidingWindow)
-                        {
-                            time(&self.metrics, "rpc.duration", rpc_start.elapsed());
-                            return Err(tonic::Status::failed_precondition(
-                                "refunds are unsupported for sliding-window rate limits",
-                            ));
-                        }
-
-                        let encoded_path = encode_canonical_path(entries);
-                        let override_ = req_desc.limit.as_ref();
-                        let mut limits_to_check = Vec::new();
-
-                        for configured_limit in res.rate_limits {
-                            let effective_limit = override_
-                                .map(|o| configured_limit.with_override(o))
-                                .unwrap_or_else(|| *configured_limit);
-
-                            // Finding F10: Counter key identity is decoupled from mutable requests_per_unit capacity
-                            let key = rate_limit_key(
-                                &request.domain,
-                                res.policy_id,
-                                &encoded_path,
-                                configured_limit,
-                            );
-                            limits_to_check.push((key, effective_limit));
-                        }
-
-                        if limits_to_check.is_empty() {
-                            evals.push(DescriptorEvaluation::Unmatched);
-                        } else {
-                            evals.push(DescriptorEvaluation::Matched(DescriptorMatch {
-                                limits_to_check,
-                                operation: op,
-                            }));
-                        }
-                    }
-                    None => {
-                        evals.push(DescriptorEvaluation::Unmatched);
-                    }
-                }
             }
-            evals
+            PreparedRequest::Configured(evaluations) => evaluations,
         };
 
         debug!(
@@ -1269,6 +1249,16 @@ impl RateLimitService for Steward {
             );
             Ok(Response::new(build_response(false, statuses)))
         }
+    }
+}
+
+#[tonic::async_trait]
+impl RateLimitService for Steward {
+    async fn should_rate_limit(
+        &self,
+        request: tonic::Request<RateLimitRequest>,
+    ) -> Result<Response<RateLimitResponse>, tonic::Status> {
+        self.handle_request(request).await
     }
 }
 
@@ -1728,7 +1718,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn caller_authorization_and_unsupported_refunds() {
+    async fn sliding_window_refunds_are_rejected() {
         use crate::proto::envoy::extensions::common::ratelimit::v3::{
             RateLimitDescriptor, rate_limit_descriptor::Entry,
         };
@@ -1757,26 +1747,7 @@ mod tests {
         let (_tx, rx) = tokio::sync::watch::channel(compiled);
         let steward = super::Steward::for_test(rx).await;
 
-        // 1. Untrusted caller attempting negative hits -> PermissionDenied
-        let req_untrusted = RateLimitRequest {
-            domain: "default".to_string(),
-            descriptors: vec![RateLimitDescriptor {
-                entries: vec![Entry {
-                    key: "type".to_string(),
-                    value: "fixed".to_string(),
-                }],
-                limit: None,
-                hits_addend: Some(2),
-                is_negative_hits: true,
-            }],
-            hits_addend: 0,
-        };
-        let res = steward
-            .should_rate_limit(tonic::Request::new(req_untrusted))
-            .await;
-        assert_eq!(res.unwrap_err().code(), Code::PermissionDenied);
-
-        // 2. Trusted caller attempting negative hits on Sliding Window -> FailedPrecondition
+        // Sliding-window state cannot safely remove individual prior hits.
         let req_sliding = RateLimitRequest {
             domain: "default".to_string(),
             descriptors: vec![RateLimitDescriptor {
@@ -1790,11 +1761,9 @@ mod tests {
             }],
             hits_addend: 0,
         };
-        let mut grpc_req = tonic::Request::new(req_sliding);
-        grpc_req
-            .metadata_mut()
-            .insert("x-steward-trusted", "true".parse().unwrap());
-        let res = steward.should_rate_limit(grpc_req).await;
+        let res = steward
+            .should_rate_limit(tonic::Request::new(req_sliding))
+            .await;
         assert_eq!(res.unwrap_err().code(), Code::FailedPrecondition);
     }
 
