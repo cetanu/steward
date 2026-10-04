@@ -6,6 +6,7 @@ RUN apt-get update \
 WORKDIR /project
 COPY Cargo.toml Cargo.lock rust-toolchain.toml build.rs ./
 COPY src src
+COPY proto/vendor proto/vendor
 RUN cargo build --release --locked --bin steward
 
 FROM debian:bookworm-slim
