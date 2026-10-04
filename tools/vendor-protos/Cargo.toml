@@ -1,0 +1,9 @@
+[package]
+name = "vendor-protos"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+
+[dependencies]
+reqwest = { version = "0.13.5", features = ["blocking"] }

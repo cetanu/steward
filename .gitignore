@@ -1,5 +1,8 @@
 /target
-/proto
+/tools/vendor-protos/target
+/proto/*
+!/proto/vendor/
+!/proto/vendor/**
 /test-reports
 /release
 *.tar.gz
