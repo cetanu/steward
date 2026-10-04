@@ -13,8 +13,8 @@ This directory contains production monitoring and Service Level Objective (SLO) 
 The `steward-slo` dashboard is organized into logical operational rows:
 
 ### Row 1: Service Level Objectives (SLOs)
-- **Enforcement Availability SLO Gauge:** Visualizes compliance against the ratified $\ge 99.99\%$ rolling 30-day enforcement availability contract.
-- **1-Hour Error Budget Burn Rate:** Tracks whether transient errors or timeouts are rapidly depleting the 0.01% error budget (Alerts at $14.4\times$ 1-hour burn rate).
+- **Enforcement Availability SLO Gauge:** Visualizes compliance against the 99.99% rolling 30-day enforcement availability target.
+- **1-Hour Error Budget Burn Rate:** Tracks whether transient errors or timeouts are rapidly depleting the error budget (alerts at 14.4x 1-hour burn rate).
 - **Active Policy Age:** Real-time gauge of the oldest configuration snapshot currently serving traffic across the replica fleet.
 - **Stale Snapshot Status:** Binary indicator (`0` = FRESH, `1` = STALE CRITICAL) triggering if snapshot age exceeds `max_stale_duration` (3600 seconds).
 
@@ -27,12 +27,12 @@ The `steward-slo` dashboard is organized into logical operational rows:
 - **Admission Control & In-Flight Concurrency:** Monitored against the 1,024 permit global ceiling. Tracks `requests.in_flight`, `requests.rejected_admission`, and `requests.deadline_exceeded`.
 
 ### Row 3: Latency Percentiles (SLO Targets)
-- **Request Decision Latency:** $p50$, $p99$ allowed, $p99$ denied, and $p99.9$ overall latency percentiles. Evaluated against the $p99 \le 5\text{ ms}$ and $p99.9 \le 10\text{ ms}$ SLO budgets.
-- **Redis Backend Phase Latency:** Dedicated $p50$, $p95$, and $p99$ timers measuring the raw Redis command execution round-trip time.
+- **Request Decision Latency:** p50, p99 allowed, p99 denied, and p99.9 overall latency percentiles. Evaluated against p99 <= 5ms and p99.9 <= 10ms targets.
+- **Redis Backend Phase Latency:** Dedicated p50, p95, and p99 timers measuring the raw Redis command execution round-trip time.
 
 ### Row 4: Redis Storage Backend & Script Health
 - **Redis Errors & Timeouts:** Counts of connection errors, socket timeouts, and transparent `NOSCRIPT` script cache reload events.
-- **Redis Primary Memory & Replication Health:** Memory saturation percentage against `maxmemory` (Warning: $\ge 75\%$, Critical: $\ge 85\%$) and connected replica count.
+- **Redis Primary Memory & Replication Health:** Memory saturation percentage against `maxmemory` (Warning: >= 75%, Critical: >= 85%) and connected replica count.
 
 ### Row 5: Configuration Lifecycle & Version Convergence
 - **Fleet Configuration Version Convergence:** Displays the hex version digest prefix for all running replicas to detect version divergence during rolling deployments or localized loader failures.

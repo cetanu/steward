@@ -1,106 +1,78 @@
-# Runbook: Redis Primary Failover, Memory Exhaustion, and Connectivity
+# Runbook: Redis Failover, Out-of-Memory, and Connectivity
 
-**Target Alerts:**
-- `StewardRedisErrorRateElevated`
-- `StewardRedisMemorySaturationWarning`
-- `StewardRedisMemorySaturationCritical`
-- `StewardRedisReplicaDisconnected`
+Use this runbook when Redis errors elevate, memory approaches limits, or a failover occurs.
 
 ---
 
-## 1. Overview & Architecture Context
+## 1. Context
 
-Steward relies on Redis as its authoritative external counter store. To protect rate-limiting semantics against silent quota resets, all production Redis instances enforce **`maxmemory-policy noeviction`** as ratified in [`docs/redis-operational-guide.md`](../redis-operational-guide.md).
+Steward uses Redis with `maxmemory-policy noeviction`. If Redis memory fills up:
+- Write commands return an out-of-memory error (`OOM command not allowed`).
+- Steward returns a gRPC `Unavailable` status.
+- Envoy handles this according to its `failure_mode_deny` setting (`false` = admit traffic; `true` = reject traffic).
 
-When Redis reaches `maxmemory`, it rejects write operations with `OOM command not allowed when used memory > 'maxmemory'`. Steward catches this and applies the **F06 Error Precedence Rule**:
-- Definitively denied calls (`OVER_LIMIT`) continue to be enforced.
-- Undetermined calls return gRPC `Status::unavailable("rate limit storage backend is unavailable")`.
-- Envoy intercepts `Unavailable` and enforces its configured `failure_mode_deny` posture.
-
-Steward multiplexes requests over an async `redis::aio::ConnectionManager`, automatically reconnecting upon socket termination and reloading Lua scripts upon `NOSCRIPT` cache flushes.
+Steward uses an asynchronous connection manager that automatically reconnects when sockets drop and reloads Lua scripts on `NOSCRIPT` errors.
 
 ---
 
-## 2. Immediate Diagnostic Steps
+## 2. Diagnosis
 
-### Step 1: Connect to Redis and Inspect Memory
+### Check Memory Usage
 ```bash
-# Connect to current Redis endpoint
 redis-cli -h <redis-endpoint> -p 6379 INFO memory
 ```
-Key metrics to review:
-- `used_memory_human`: Total memory allocated by Redis.
-- `maxmemory_human`: Maximum memory threshold.
-- `mem_fragmentation_ratio`: If $> 1.5$, memory allocator fragmentation is elevated.
+Key fields:
+- `used_memory_human`: Memory currently used.
+- `maxmemory_human`: Configured ceiling.
 
-### Step 2: Check for OOM Errors and Rejections
+### Test for OOM Errors
 ```bash
-redis-cli -h <redis-endpoint> -p 6379 INFO stats | grep -E "rejected_connections|total_net_input_bytes"
-# Check if writes are being denied due to OOM
-redis-cli -h <redis-endpoint> -p 6379 SET _steward_canary_probe 1
+redis-cli -h <redis-endpoint> -p 6379 SET _steward_probe 1
 ```
-- If the Canary SET command returns `(error) OOM command not allowed`, Redis has hit `maxmemory`!
+If this returns `OOM command not allowed`, Redis has reached its memory limit.
 
-### Step 3: Inspect Replication Status and Standby Health
+### Check Replication Status
 ```bash
 redis-cli -h <redis-endpoint> -p 6379 INFO replication
+# Verify role is master and connected_slaves >= 1
 ```
-- `role`: Must be `master`.
-- `connected_slaves`: Must be $\ge 1$.
-- `slave0: offset=..., lag=...`: `lag` should be 0 or 1. If lag $> 5$, the replica is falling behind.
 
 ---
 
-## 3. Actionable Mitigation Runbooks
+## 3. Remediation
 
-### Scenario A: Redis Memory Saturation (> 85% or OOM Rejections)
-**Cause:** Key cardinality has exceeded the provisioned memory footprint (often due to sudden explosion in distinct client IP addresses or long-duration sliding logs).
-**Immediate Remediation:**
-1. **Dynamic Memory Scaling (Emergency):**
-   If the underlying VM/container host has spare memory capacity:
-   ```bash
-   # Temporarily increase maxmemory to provide immediate breathing room
-   redis-cli -h <redis-endpoint> CONFIG SET maxmemory <new_higher_limit_bytes>
-   ```
-2. **Scale Up Instance Type:**
-   Scale up the managed Redis cluster instance type (e.g. AWS ElastiCache instance class) with an online failover.
-3. **Audit High-Cardinality Policies:**
-   Review active rate-limit descriptors for unbounded wildcard keys (e.g. tracking per-session-cookie rather than per-IP/account).
-
-### Scenario B: Unplanned Redis Primary Crash / Outage
-**Cause:** Primary hardware failure, kernel OOM kill, or network partition.
-**Automated Handling:**
-1. Cloud Orchestrator (e.g. AWS ElastiCache or Redis Sentinel) detects missed heartbeats and promotes the standby replica to primary.
-2. The endpoint VIP or DNS record is updated to target the new primary.
-3. **Steward Automatic Reconnection:**
-   - Steward's `ConnectionManager` detects broken TCP sockets and retries connection in the background.
-   - When the promoted primary accepts connections, Steward re-establishes TCP channels automatically without requiring pod restarts.
-   - If the script cache is empty on the new primary, Steward intercepts `NOSCRIPT` and transparently reloads its Lua scripts (`fixed_window.lua`, `token_bucket.lua`, `sliding_window.lua`).
-
-**Operator Actions during Outage:**
-- Verify Envoy ingress traffic behavior:
-  - If `failure_mode_deny: false`: Ingress traffic is admitted (fail-open) while preserving overall upstream availability.
-  - If `failure_mode_deny: true`: Ingress traffic is rejected (fail-closed) to protect protected backends.
-- Monitor `redis.errors` and `redis.timeouts` in the Grafana dashboard to confirm the moment of reconnection.
-
-### Scenario C: Standby Replica Disconnected (`connected_slaves == 0`)
-**Cause:** Replica crashed, rebooted, or the replication buffer overflowed.
+### Scenario A: Redis Memory Saturation (> 85% or OOM)
+**Cause:** Active key count exceeded provisioned memory, often due to high-cardinality keys (e.g. unique user tokens) or large sliding-window sets.
 **Actions:**
-1. Check replica pod/instance health and system logs (`dmesg`, container exit codes).
-2. Check replication buffer settings:
+1. **Temporarily increase memory** if host capacity allows:
    ```bash
-   redis-cli -h <primary-host> CONFIG GET client-output-buffer-limit
+   redis-cli -h <redis-endpoint> CONFIG SET maxmemory <new_bytes>
    ```
-3. Restart or reprovision the standby replica to restore high-availability redundancy.
+2. **Scale up Redis instance size** via your cloud provider or infrastructure manager.
+3. Review rate-limit policies to ensure descriptors do not use unbounded high-cardinality keys.
+
+### Scenario B: Redis Primary Failover / Crash
+**Cause:** Host reboot, hardware failure, or network disruption.
+**Behavior:**
+1. Standby replica is promoted to primary by Sentinel or managed cloud orchestrator.
+2. Steward automatically re-establishes connections and re-caches Lua scripts on the new primary.
+3. During the brief cutover, Envoy's `failure_mode_deny` setting determines whether traffic is admitted (default: fail-open) or rejected.
+**Actions:**
+- Monitor `redis.errors` in Grafana to confirm reconnection.
+- Verify that DNS or VIP points to the new primary node.
+
+### Scenario C: Replica Disconnected
+**Cause:** Replica crashed or lagged behind the primary replication stream.
+**Actions:**
+1. Check replica container/host logs for crash or out-of-memory signals.
+2. Restart or reprovision the replica to restore redundancy.
 
 ---
 
-## 4. Post-Incident Verification
-
+## 4. Verification
 1. `redis.errors` and `redis.timeouts` drop back to 0.
-2. `redis_memory_used_bytes / redis_memory_max_bytes` is $< 75\%$.
-3. `connected_slaves` is $\ge 1$.
-4. Canary probe write succeeds without error:
+2. Memory usage drops below 75% of `maxmemory`.
+3. Canary write test succeeds:
    ```bash
-   redis-cli -h <redis-endpoint> SET _steward_canary_probe ok EX 10
+   redis-cli -h <redis-endpoint> SET _steward_probe ok EX 10
    ```

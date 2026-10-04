@@ -1,16 +1,16 @@
-# Steward Performance Certification & Benchmark Baselines (M2.7)
+# Steward Performance & Benchmark Baselines
 
-This document records the official baseline performance profile and capacity certification for `steward` in accordance with Milestone **M2.7** and finding **F18** from `docs/production-readiness.md`.
+This document records the baseline performance profile and capacity measurements for `steward`.
 
-All measurements were generated using the reproducible, self-contained open-loop benchmarking harness located at `src/bin/bench_harness.rs`.
+All measurements were generated using the open-loop benchmarking harness at `src/bin/bench_harness.rs`.
 
 ---
 
-## 1. Executive Summary & SLO Qualification
+## 1. Executive Summary
 
-The benchmark suite verifies that `steward` achieves and exceeds all targets defined in `docs/slo-and-limits.md` and `docs/production-contract.md`:
+The benchmark suite verifies throughput, latency, and resource utilization across supported algorithms and configurations:
 
-| Metric / Objective | M0 Target / Budget | Measured Baseline (20k QPS, Fixed Window) | Status | Margin / Headroom |
+| Metric | Target Budget | Measured Baseline (20k QPS, Fixed Window) | Status | Margin |
 | :--- | :--- | :--- | :--- | :--- |
 | **Throughput (1-2 Rules)** | >= 20,000 QPS | **24,994 QPS** (tested max) | **PASSED** | +25% above qualification target |
 | **p50 Latency** | <= 2.0 ms | **0.87 ms** (866 µs) | **PASSED** | 56% headroom |
@@ -85,7 +85,7 @@ The following data was captured on a reference Linux test environment under rele
 ### 3. Algorithm Latency Comparison
 - **Fixed Window**: Fastest baseline (p50: 0.87 ms, p99: 1.48 ms, p99.9: 2.18 ms) due to single `INCRBY` / `EXPIRE` Lua script semantics.
 - **Token Bucket**: Near-identical performance (p50: 0.90 ms, p99: 1.54 ms, p99.9: 2.39 ms). The Lua script's `TIME` query and fractional refill arithmetic add less than 30 µs to p50 latency.
-- **Sliding Window**: p50 is 0.91 ms and p99 is 1.67 ms. At the extreme tail (p99.9), latency rises to 17.09 ms due to Redis `ZREMRANGEBYSCORE` and `ZREMRANGEBYRANK` pruning passes on high-cardinality sorted sets. This empirically ratifies the architectural scope decision in `docs/slo-and-limits.md` Section 5 recommending Fixed Window or Token Bucket for high-throughput primary ingress paths and reserving Sliding Window for sensitive lower-rate security boundaries.
+- **Sliding Window**: p50 is 0.91 ms and p99 is 1.67 ms. At p99.9, latency rises to 17.09 ms due to Redis `ZREMRANGEBYSCORE` and `ZREMRANGEBYRANK` pruning passes on high-cardinality sorted sets. Fixed Window or Token Bucket are recommended for high-throughput primary ingress paths, while Sliding Window is suitable for lower-rate security boundaries.
 
 ### 4. Key Skew and Contention Resilience
 - Comparing **Uniform-Flat** against **Zipfian-Skewed** (where top 1% of keys receive over 50% of requests) reveals identical p50 (0.87 ms) and p99 (1.48 ms) performance.
@@ -102,9 +102,3 @@ The following data was captured on a reference Linux test environment under rele
 - Steward service RSS remained at ~22.9 MiB throughout the 700,000+ request test run.
 - Redis RSS stabilized at ~46.8 MiB.
 - Neither service showed sustained memory growth or leaks.
-
----
-
-## 5. Certification Sign-Off
-
-The benchmark results certify that `steward` fully satisfies the requirements of **M2.7** and **F18**. Milestone M2 is concluded and production readiness gates for bounded async execution are officially met.

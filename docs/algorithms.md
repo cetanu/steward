@@ -1,176 +1,80 @@
-# Steward Rate Limiting Algorithms Specification
+# Rate Limiting Algorithms
 
-This document defines the normative mathematical models, state representations, guarantees, boundary behaviors, time sources, and limits for all rate-limiting algorithms implemented in Steward.
+Steward supports three rate-limiting algorithms, each tailored for different use cases and trade-offs.
 
----
+## Algorithm Comparison
 
-## 1. Overview & Architecture
-
-Steward provides three rate-limiting algorithms, each optimized for distinct operational and traffic shaping characteristics:
-
-| Dimension | Fixed Window (`fixed_window`) | Token Bucket (`token_bucket`) | Sliding Window (`sliding_window`) |
+| Feature | Fixed Window (`fixed_window`) | Token Bucket (`token_bucket`) | Sliding Window (`sliding_window`) |
 | :--- | :--- | :--- | :--- |
-| **Redis Data Structure** | Redis String (integer counter) | Redis Hash (`tokens`, `timestamp_ms`) | Redis Sorted Set (ZSET) |
-| **State Complexity** | $O(1)$ space | $O(1)$ space | $O(N)$ space ($N \le 10{,}000$) |
-| **Time Complexity** | $O(1)$ per evaluation | $O(1)$ per evaluation | $O(\log N + M)$ per evaluation |
-| **Time Source** | Redis TTL / Server epoch | Authoritative Redis `TIME` (ms) | Authoritative Redis `TIME` (ms + $\mu$s) |
-| **Boundary Burst** | Up to $2 \times$ across boundaries | Bounded to burst capacity $C$ | $0 \times$ overshoot (exact trailing window) |
-| **Refill Model** | Step-function (at window reset) | Continuous fractional ($C / W_{\text{ms}}$) | Event expiration at $t - W_{\text{ms}}$ |
-| **Refunds Supported** | Yes (clamped to 0) | Yes (clamped to $C$) | No (explicitly rejected) |
-| **Max Hit Cost** | Unbounded ($\le \text{limit}$) | Bounded by capacity $C$ | Hard cap: 100 hits per RPC |
-| **Retention Bounds** | 1 key, TTL = window duration | 1 key, PTTL = $2 \times W_{\text{ms}}$ | 1 ZSET, capped at 10,000 members |
+| **Redis Data Structure** | String (integer counter) | Hash (`tokens`, `timestamp_ms`) | Sorted Set (`ZSET`) |
+| **Memory per Key** | ~128 bytes | ~210 bytes | ~120 bytes + ~50 bytes per event |
+| **Time Complexity** | $O(1)$ | $O(1)$ | $O(\log N + M)$ |
+| **Time Source** | Window expiration / TTL | Redis server time (`TIME`) | Redis server time (`TIME`) |
+| **Boundary Spike** | Up to $2\times$ at window boundaries | Bounded to capacity | None (exact rolling window) |
+| **Refill Behavior** | Step reset at window boundary | Continuous fractional refill | Event expiration after window duration |
+| **Refunds Supported** | Yes | Yes | No |
+| **Max Hit Cost** | Limited by configured quota | Limited by capacity | 100 hits per request |
+| **Default** | Yes | No | No |
 
-All algorithms execute atomically inside Redis via Lua scripts (`EVALSHA`), guaranteeing that individual key operations are serialized without race conditions or partial updates.
-
----
-
-## 2. Fixed Window Algorithm (`fixed_window`)
-
-### 2.1 Mathematical Model
-The fixed window algorithm segments time into uniform, non-overlapping windows of duration $W$.
-
-In Steward, fixed windows are evaluated via atomic increment:
-1. Upon request with hit cost $H$:
-   $$\text{current} \leftarrow \text{INCRBY}(K, H)$$
-2. If $\text{current} = H$ (first hit in a new window lifecycle):
-   $$\text{EXPIRE}(K, W)$$
-3. Admission decision:
-   $$\text{allowed} = \begin{cases} \text{true} & \text{if } \text{current} \le L \\ \text{false} & \text{if } \text{current} > L \end{cases}$$
-   where $L$ is the configured limit (`requests_per_unit`).
-
-### 2.2 State Representation
-- **Key**: Canonical rate limit key string (e.g. `steward:{default}:v1:pol_1:path:fw:60s`).
-- **Value**: Redis String containing a base-10 ASCII integer counter.
-- **TTL**: Set via `EXPIRE` on first increment.
-
-### 2.3 Refund Mechanics (`fixed_window_refund.lua`)
-1. Reads existing value: $\text{current} \leftarrow \text{GET}(K)$.
-2. If key does not exist, returns 0.
-3. Computes: $\text{new\_val} = \max(0, \text{current} - H_{\text{refund}})$.
-4. Writes: $\text{SET}(K, \text{new\_val}, \text{"KEEPTTL"})$.
-5. Returns $\text{new\_val}$. Clamping at 0 prevents negative counters.
-
-### 2.4 Guarantees and Boundary Behaviors
-- **Memory & Compute:** Fixed $O(1)$ space and $O(1)$ time complexity. Lowest CPU overhead on Redis.
-- **Boundary Burst (Double-Limit Anomaly):** If an identity sends $L$ requests at the very end of window $t$ (e.g., $t + W - \epsilon$) and another $L$ requests at the beginning of window $t+1$ (e.g., $t + W + \epsilon$), up to $2 \times L$ requests are admitted within an interval of $2\epsilon$.
-- **Attempt Counting:** Denied requests increment the counter in Redis, recording demand even when throttled.
+All operations are executed atomically in Redis using cached Lua scripts.
 
 ---
 
-## 3. Token Bucket Algorithm (`token_bucket`)
+## 1. Fixed Window (`fixed_window`)
 
-### 3.1 Mathematical Model
-The token bucket algorithm maintains a fractional token reserve refilled continuously over time up to a maximum burst capacity $C$, allowing traffic bursts while strictly enforcing a sustained average rate.
+The fixed window algorithm is the default. It tracks request counts within fixed calendar intervals (e.g. 1 minute, 1 hour).
 
-Given:
-- Capacity $C$ (`requests_per_unit` tokens)
-- Window duration $W_{\text{ms}}$ in milliseconds
-- Continuous refill rate $r$:
-  $$r = \frac{C}{W_{\text{ms}}} \quad \left(\frac{\text{tokens}}{\text{millisecond}}\right)$$
+### How It Works
+1. Each request increments an integer counter using Redis `INCRBY`.
+2. On the first request in a window, a TTL matching the window duration is set using `EXPIRE`.
+3. If the counter is less than or equal to `requests_per_unit`, the request is allowed. If greater, it is denied.
 
-When an evaluation arrives at Redis server time $t_{\text{now}}$ with cost $H$:
-1. **Clock Drift & Monotonicity Clamping:**
-   Retrieve existing state $(\text{tokens}_{\text{prev}}, t_{\text{last}})$.
-   If $t_{\text{last}}$ exists and $t_{\text{now}} < t_{\text{last}}$ (simulated or real backward clock shift):
-   $$t_{\text{now}} \leftarrow t_{\text{last}}$$
-2. **Token Initialization / Refill:**
-   If key does not exist:
-   $$\text{tokens} \leftarrow C, \quad t_{\text{last}} \leftarrow t_{\text{now}}$$
-   Else:
-   $$\Delta t = \max(0, t_{\text{now}} - t_{\text{last}})$$
-   $$\text{tokens} \leftarrow \min(C, \text{tokens}_{\text{prev}} + \Delta t \times r)$$
-3. **Admission & Consumption:**
-   $$\text{allowed} = \begin{cases} 1 & \text{if } \text{tokens} \ge H \\ 0 & \text{if } \text{tokens} < H \end{cases}$$
-   If $\text{allowed} = 1$:
-   $$\text{tokens} \leftarrow \text{tokens} - H$$
-4. **State Persistence & Expiration:**
-   Write updated $(\text{tokens}, t_{\text{now}})$ to Redis Hash.
-   Set expiry: $\text{PEXPIRE}(K, 2 \times W_{\text{ms}})$.
-   Return $\{ \text{allowed}, \lfloor\text{tokens}\rfloor \}$.
+### Refunds
+Refunds are supported using `fixed_window_refund.lua`. When a request with `is_negative_hits` arrives, the counter is decremented, clamped at 0 to prevent negative values.
 
-### 3.2 State Representation
-- **Key**: Canonical rate limit key string (e.g. `steward:{default}:v1:pol_api:path:tb:10s`).
-- **Data Structure**: Redis Hash (`HSET`) with two fields:
-  - `tokens`: IEEE 754 floating-point string representation of available tokens.
-  - `timestamp_ms`: Integer string representation of the authoritative Redis millisecond timestamp.
-- **TTL**: Refreshed to $2 \times W_{\text{ms}}$ on every evaluation to preserve idle token balances across small inactivity windows while preventing abandoned key leaks.
-
-### 3.3 Authoritative Time Source & Backward Clock Drift Protection
-- **Authoritative Server Time:** Scripts do not trust client application clocks. The Lua script invokes Redis `TIME` (`[seconds, microseconds]`), computing:
-  $$t_{\text{now}} = \text{seconds} \times 1000 + \lfloor\text{microseconds} / 1000\rfloor$$
-- **Clock Drift Clamping:** If NTP stepping or primary-replica failover causes $t_{\text{now}} < t_{\text{last}}$, the script clamps $t_{\text{now}} = t_{\text{last}}$. As a result:
-  - Elapsed time $\Delta t = 0$.
-  - No spurious token refill occurs.
-  - The stored timestamp does not regress backwards.
-
-### 3.4 Dynamic Capacity Updates on Live Keys
-Because counter key identity depends on `domain`, `policy_id`, `path`, `algorithm`, and `unit` (but **not** on numeric capacity $C$), changing a policy's capacity in configuration retains the existing live key in Redis.
-- When evaluated with a new capacity $C_{\text{new}}$:
-  - Refill rate immediately becomes $r_{\text{new}} = C_{\text{new}} / W_{\text{ms}}$.
-  - The accumulator caps tokens at $C_{\text{new}}$: $\text{tokens} = \min(C_{\text{new}}, \text{tokens} + \Delta t \times r_{\text{new}})$.
-  - Existing token reserves are conserved up to the new ceiling without resetting state.
-
-### 3.5 Refund Mechanics (`token_bucket_refund.lua`)
-1. Refills tokens up to $t_{\text{now}}$ using standard elapsed math and clock clamping.
-2. Credits refunded tokens: $\text{tokens} \leftarrow \min(C, \text{tokens} + H_{\text{refund}})$.
-3. Persists state and refreshes PTTL. Returns $\{ 1, \lfloor\text{tokens}\rfloor \}$.
+### Trade-offs
+- **Pros:** Lowest memory (~128 bytes/key) and lowest Redis CPU usage.
+- **Cons:** Traffic spikes can double at window boundaries. For example, if a user sends their entire limit at the end of minute 1 and again at the start of minute 2, they can send $2\times$ their limit in a short span.
 
 ---
 
-## 4. Sliding Window Algorithm (`sliding_window`)
+## 2. Token Bucket (`token_bucket`)
 
-### 4.1 Mathematical Model
-The sliding window algorithm maintains an exact time-series event log of admitted requests in a trailing sliding window $[t_{\text{now}} - W_{\text{ms}}, t_{\text{now}}]$. It completely eliminates the $2 \times$ boundary burst of fixed windows.
+The token bucket algorithm provides smooth rate limiting with controlled burst capacity.
 
-Given:
-- Limit $L$ (`requests_per_unit`)
-- Window duration $W_{\text{ms}}$
-- Request hit cost $H$
+### How It Works
+1. State is stored in a Redis Hash with two fields:
+   - `tokens`: Current available tokens (floating point).
+   - `timestamp_ms`: Millisecond timestamp of the last evaluation, obtained from Redis `TIME`.
+2. On each request, Steward calculates the elapsed time since the last update and adds refilled tokens:
+   $$\text{refill} = \Delta t \times \frac{\text{capacity}}{\text{window\_ms}}$$
+   Tokens are capped at the maximum capacity (`requests_per_unit`).
+3. If enough tokens are available for the hit cost, tokens are deducted and the request is allowed. Otherwise, it is denied.
+4. Key expiration is set to $2\times$ the window duration to prevent abandoned keys from accumulating in memory.
 
-When a request arrives at Redis time $t_{\text{now}}$ (with microsecond component $u_{\text{now}}$):
-1. **Input Validation:**
-   $$1 \le H \le 100$$
-   Requests with $H > 100$ or $H < 1$ are rejected immediately with $\{0, 0\}$.
-2. **Exact Log Eviction:**
-   $$\text{ZREMRANGEBYSCORE}(K, -\infty, t_{\text{now}} - W_{\text{ms}})$$
-   Evicts all events older than the sliding window boundary.
-3. **Capacity Assessment:**
-   $$\text{current} \leftarrow \text{ZCARD}(K)$$
-   $$\text{allowed} = \begin{cases} 1 & \text{if } \text{current} + H \le L \\ 0 & \text{if } \text{current} + H > L \end{cases}$$
-4. **Log Insertion (Allowed Only):**
-   If $\text{allowed} = 1$:
-   For each $i \in \{1, \dots, H\}$, generate unique member identifier:
-   $$\text{member}_i = u_{\text{now}} : \text{nonce} : i$$
-   where $\text{nonce}$ is a 128-bit (32 hex character) cryptographically secure random value generated per request.
-   $$\text{ZADD}(K, t_{\text{now}}, \text{member}_i)$$
-   $$\text{current} \leftarrow \text{current} + H$$
-5. **Retention Cap Enforcement (Bounded Work):**
-   If $\text{current} > 10{,}000$:
-   $$\text{ZREMRANGEBYRANK}(K, 0, \text{current} - 10{,}001)$$
-   $$\text{current} \leftarrow 10{,}000$$
-   Trims the oldest events to strictly bound Redis memory and CPU work.
-6. **Persistence & Expiration:**
-   $$\text{PEXPIRE}(K, 2 \times W_{\text{ms}})$$
-   Return $\{ \text{allowed}, \text{current} \}$.
+### Clock Drift Protection
+To protect against clock drift or NTP adjustments, Redis server time (`TIME`) is used rather than application client timestamps. If the current time appears earlier than `timestamp_ms`, time is clamped to avoid spurious token generation.
 
-### 4.2 State Representation
-- **Key**: Canonical rate limit key string (e.g. `steward:{default}:v1:pol_sw:path:sw:60s`).
-- **Data Structure**: Redis Sorted Set (ZSET).
-  - **Score**: Millisecond timestamp ($t_{\text{now}}$) from Redis `TIME`.
-  - **Member**: `<usec>:<nonce>:<i>` where:
-    - `<usec>`: Microsecond timestamp from Redis `TIME`.
-    - `<nonce>`: 32-character hexadecimal string generated via CSPRNG (`ring::rand::SystemRandom`).
-    - `<i>`: 1-based hit sequence index ($1 \le i \le H$).
-- **TTL**: Refreshed to $2 \times W_{\text{ms}}$ on every evaluation.
+### Dynamic Capacity Updates
+Counter key names depend on the domain, policy ID, path, and unit, but not the capacity. If you change a policy's capacity in configuration, the existing token balance is preserved up to the new limit without resetting the counter.
 
-### 4.3 Multi-Replica Concurrency & Collision Freedom
-In distributed deployments with multiple Steward replicas serving identical rate-limit keys:
-- Two replicas evaluating requests within the identical microsecond generate distinct 128-bit random nonces.
-- Member collisions have probability $p < 2^{-128}$, effectively zero.
-- Replicas never overwrite concurrent events in `ZADD`.
-- Redis executes each Lua script atomically, ensuring total ordering of evictions, counts, and insertions.
+### Trade-offs
+- **Pros:** Smooth traffic shaping, prevents boundary spikes, allows configuring controlled burst capacity.
+- **Cons:** Slightly larger state per key (~210 bytes) than fixed window.
 
-### 4.4 Resource Bounds and Non-Refundable Guarantees
-- **Hit Cost Bounding:** Hit cost is strictly bounded to $H \le 100$ per call to prevent unbounded Lua execution loops.
-- **Log Retention Bounding:** Set size is strictly capped at $10{,}000$ members per key via `ZREMRANGEBYRANK`, preventing memory exhaustion.
-- **Non-Refundable:** Sliding window log entries represent physical event timestamps. Arbitrary event refunds cannot delete historical timestamps safely without violating temporal ordering. Refunds on sliding window policies are explicitly rejected (`HitOperation::Refund` returns an error).
+---
+
+## 3. Sliding Window (`sliding_window`)
+
+The sliding window algorithm maintains an exact rolling log of recent request timestamps. It completely eliminates window boundary spikes.
+
+### How It Works
+1. State is stored in a Redis Sorted Set (`ZSET`), where each member represents an event and the score is the Redis millisecond timestamp.
+2. Expired events older than $(t_{\text{now}} - \text{window\_ms})$ are removed using `ZREMRANGEBYSCORE`.
+3. The remaining events are counted with `ZCARD`. If $\text{current} + \text{hits} \le \text{limit}$, the request is allowed.
+4. If allowed, new events are added to the set with unique members formatted as `<microsecond>:<nonce>:<index>`, where `<nonce>` is a random identifier. This prevents concurrent requests from different replicas from overwriting each other.
+5. If the set grows larger than 10,000 events, the oldest entries are pruned using `ZREMRANGEBYRANK` to cap memory usage.
+
+### Trade-offs
+- **Pros:** Exact rolling enforcement with zero boundary overshoot.
+- **Cons:** Higher memory and CPU usage on Redis proportional to the number of events. Refunds are not supported because historical event logs cannot be retroactively adjusted without breaking time ordering.

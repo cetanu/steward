@@ -491,7 +491,7 @@ mod tests {
 
     #[test]
     fn exact_vs_wildcard_precedence() {
-        // Table in docs/accounting-contract.md Section 4.1:
+        // Precedence rules: exact matches take precedence over wildcard matches:
         // Rule 1: (tenant, acme) -> (route, /pay): 5 req/s
         // Rule 2: (tenant, acme) -> (route, *): 50 req/s
         // Rule 3: (tenant, *) -> (route, /pay): 20 req/s
@@ -684,7 +684,7 @@ mod tests {
 
     #[test]
     fn canonical_key_format_matches_accounting_contract() {
-        // Test concrete examples from Section 7.3 of docs/accounting-contract.md:
+        // Test canonical key format examples:
         // Fixed Window (Exact match, 1-minute window):
         // steward:{default}:v1:pol_pay:6:tenant=4:acme/5:route=4:/pay:fw:60s
         let limit_fw = RateLimit {

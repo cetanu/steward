@@ -1,8 +1,6 @@
 # Correctness and Protocol Qualification Matrix Results
 
 - **Milestone:** M4.1 — Release Qualification
-- **Date:** October 2026
-- **Status:** Ratified & Verified (100% Pass)
 - **Target Artifact:** `ghcr.io/cetanu/steward:latest` (Release container built on `ubuntu:noble` with pinned protobuf closure)
 - **Reference Document:** [Production Readiness Review](../production-readiness.md)
 
@@ -10,19 +8,17 @@
 
 ## 1. Executive Summary
 
-Milestone M4.1 executes the complete correctness and protocol qualification matrix ratified in [docs/production-readiness.md](../production-readiness.md#qualification-matrix) against the hardened production release artifact.
+Milestone M4.1 executes the correctness and protocol qualification matrix from [docs/production-readiness.md](../production-readiness.md#qualification-matrix) against the release artifact.
 
-All 93 automated unit/component tests and the end-to-end containerized Envoy v1.39.0 integration test suite executed with a **100% pass rate** (0 failures, 0 regressions, 0 skipped tests). Every requirement across Matching, Protocol, Algorithms, Concurrency, Failures, Configuration, and Telemetry has been certified against the release artifact.
+All 93 automated unit/component tests and the end-to-end containerized Envoy v1.39.0 integration test suite execute with a **100% pass rate** (0 failures, 0 regressions, 0 skipped tests).
 
 ---
 
 ## 2. Qualification Environment
 
-The matrix was executed in the official qualification environment using pinned dependencies and production-equivalent topologies:
-
 | Component | Version / Specification | Deployment Context |
 | --- | --- | --- |
-| **Steward Service** | `v0.1.0` (Git commit `ce048ad`) | Multi-replica release artifact (`server` & `server-replica-2`), non-root UID 10001, AWS-LC crypto provider |
+| **Steward Service** | `v0.1.0` | Multi-replica release artifact (`server` & `server-replica-2`), non-root UID 10001, AWS-LC crypto provider |
 | **Envoy Proxy** | `v1.39.0` | Official Envoy image with HTTP connection manager, `enable_x_ratelimit_headers: DRAFT_VERSION_03`, failure-mode-deny: false |
 | **Redis Backend** | `7.2.4` / Engine `7.2` | Dedicated primary with async connection manager, Lua script caching, memory eviction `noeviction` |
 | **Config Provider** | HTTP REST & File | REST configuration server (`mock_config`) with HTTP conditional headers (ETag / If-None-Match) & local YAML/JSON fallback |
@@ -30,7 +26,7 @@ The matrix was executed in the official qualification environment using pinned d
 
 ---
 
-## 3. Qualification Matrix Traceability & Execution Results
+## 3. Qualification Matrix & Results
 
 ### 3.1 Matching Scenarios
 
@@ -107,9 +103,7 @@ The matrix was executed in the official qualification environment using pinned d
 
 ---
 
-## 4. Release Decision & Conclusion
+## 4. Summary
 
-1. **Qualification Matrix Compliance:** 100% (all required scenarios implemented and certified).
-2. **Automated Verification:** 93 unit/component tests + live Docker integration suite passing in CI with 0 warnings or errors.
-3. **Artifact Integrity:** Production container image qualified with non-root security context, AWS-LC cryptography (zero `ring` dependencies), and zero vendored `.proto` files in Git.
-4. **Sign-off:** Milestone M4.1 criteria are fully satisfied. The service is qualified to proceed to M4.2 (offered-load sweeps and soak testing).
+- **Test Suite:** 93 unit/component tests + containerized Envoy integration tests passing cleanly.
+- **Artifact:** Container image qualified with non-root security context, AWS-LC cryptography, and pinned local protobuf closure.

@@ -88,12 +88,12 @@ static_resources:
                   "@type": type.googleapis.com/envoy.extensions.filters.http.ratelimit.v3.RateLimit
                   domain: default
                   request_type: both # can be 'external|internal'
-                  failure_mode_deny: false # Ratified in docs/failure-policy.md: fail-open for availability; set true for fail-closed security
+                  failure_mode_deny: false # fail-open for availability; set true for fail-closed security
                   rate_limit_service:
                     grpc_service:
                       envoy_grpc:
                         cluster_name: rls
-                      timeout: 0.020s # Explicit per-request RPC timeout (20ms as ratified in docs/slo-and-limits.md)
+                      timeout: 0.020s # Explicit per-request RPC timeout (20ms)
                     transport_api_version: V3
                   enable_x_ratelimit_headers: DRAFT_VERSION_03
               - name: envoy.filters.http.router
