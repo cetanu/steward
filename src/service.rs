@@ -922,10 +922,9 @@ impl Steward {
         request: &RateLimitRequest,
         rpc_start: std::time::Instant,
     ) -> Result<PreparedRequest, tonic::Status> {
-        validate_request(request).map_err(|status| {
+        validate_request(request).inspect_err(|_| {
             count(&self.metrics, "requests.invalid", 1);
             time(&self.metrics, "rpc.duration", rpc_start.elapsed());
-            status
         })?;
 
         let configs = self.config_rx.borrow();
