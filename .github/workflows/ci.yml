@@ -255,6 +255,8 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes protobuf-compiler
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.99.0"
